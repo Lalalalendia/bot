@@ -1,0 +1,11 @@
+services:
+  rebuild:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN in local env or ignored .env}
+      DATABASE_PATH: /data/rebuild.sqlite3
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./data:/data
+    init: true
