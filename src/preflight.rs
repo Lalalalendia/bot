@@ -95,13 +95,13 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
-    async fn wire(server: &MockServer, name: &str, response: Value, expected: u64) {
+    async fn wire(server: &MockServer, name: &str, response: Value) {
         Mock::given(method("POST"))
             .and(path(format!("/botTEST/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "ok": true, "result": response
             })))
-            .expect(expected)
+            .expect(1)
             .mount(server)
             .await;
     }
@@ -109,18 +109,18 @@ mod tests {
     #[tokio::test]
     async fn live_api_preflight_succeeds_for_ready_test_group() -> Result<()> {
         let server = MockServer::start().await;
-        wire(&server,"getMe",json!({"id":111,"username":"RebuildTestBot"}),1).await;
-        wire(&server,"getWebhookInfo",json!({"url":""}),1).await;
+        wire(&server,"getMe",json!({"id":111,"username":"RebuildTestBot"})).await;
+        wire(&server,"getWebhookInfo",json!({"url":""})).await;
         wire(&server,"getChat",json!({
             "id":-100200,"title":"Test group","type":"supergroup",
             "permissions":{"can_send_messages":true,"can_send_photos":false}
-        }),1).await;
+        })).await;
         wire(&server,"getChatMember",json!({
             "status":"administrator",
             "can_restrict_members":true,
             "can_delete_messages":true,
             "can_invite_users":true
-        }),1).await;
+        })).await;
         let tg=Telegram::mock(format!("{}/botTEST/",server.uri()));
         let report=check(&tg,-100200).await?;
         assert_eq!(report.bot_id,111);
@@ -134,8 +134,8 @@ mod tests {
     #[tokio::test]
     async fn preflight_refuses_existing_webhook_without_mutating_telegram() -> Result<()> {
         let server = MockServer::start().await;
-        wire(&server,"getMe",json!({"id":111,"username":"RebuildTestBot"}),1).await;
-        wire(&server,"getWebhookInfo",json!({"url":"https://example.org/hook"}),1).await;
+        wire(&server,"getMe",json!({"id":111,"username":"RebuildTestBot"})).await;
+        wire(&server,"getWebhookInfo",json!({"url":"https://example.org/hook"})).await;
         Mock::given(method("POST")).and(path("/botTEST/deleteWebhook"))
             .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
         Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
@@ -149,18 +149,18 @@ mod tests {
     #[tokio::test]
     async fn missing_join_permission_fails_closed() -> Result<()> {
         let server = MockServer::start().await;
-        wire(&server,"getMe",json!({"id":111,"username":"RebuildTestBot"}),1).await;
-        wire(&server,"getWebhookInfo",json!({"url":""}),1).await;
+        wire(&server,"getMe",json!({"id":111,"username":"RebuildTestBot"})).await;
+        wire(&server,"getWebhookInfo",json!({"url":""})).await;
         wire(&server,"getChat",json!({
             "id":-100200,"type":"supergroup",
             "permissions":{"can_send_messages":true}
-        }),1).await;
+        })).await;
         wire(&server,"getChatMember",json!({
             "status":"administrator",
             "can_restrict_members":true,
             "can_delete_messages":true,
             "can_invite_users":false
-        }),1).await;
+        })).await;
         let tg=Telegram::mock(format!("{}/botTEST/",server.uri()));
         let err=check(&tg,-100200).await.unwrap_err();
         assert!(err.to_string().contains("can_invite_users"));
