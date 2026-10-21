@@ -24,7 +24,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
+      - name: Publish checked Rust sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: checked-rust-sources
+          path: |
+            Cargo.lock
+            src/
+          if-no-files-found: error
+          retention-days: 3
