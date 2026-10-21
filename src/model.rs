@@ -23,10 +23,14 @@ pub struct Message {
     #[serde(rename = "from")]
     pub sender: Option<User>,
     pub text: Option<String>,
+    pub caption: Option<String>,
+    pub edit_date: Option<i64>,
     #[serde(default)]
     pub new_chat_members: Vec<User>,
     #[serde(default)]
     pub entities: Vec<MessageEntity>,
+    #[serde(default)]
+    pub caption_entities: Vec<MessageEntity>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -82,6 +86,7 @@ pub struct Callback {
 pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
+    pub edited_message: Option<Message>,
     pub callback_query: Option<Callback>,
     pub chat_member: Option<MemberChange>,
     pub chat_join_request: Option<JoinRequest>,
