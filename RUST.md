@@ -27,9 +27,18 @@ cargo run --release
 
 Do **not** commit real tokens, database files or personally identifying dumps.
 
+## Preflight before first Telegram test
+
+Start with a **separate test supergroup**. With a local BotFather token and its numeric
+`TEST_CHAT_ID`, run `cargo run --locked --release -- --preflight` or
+`docker compose run --rm rebuild --preflight`. This read-only check validates
+the Bot API identity, disabled webhook, supergroup permissions, and administrator
+rights (restrict, delete, invite). It never starts polling or changes Telegram.
+No production group is used for the first acceptance.
+
 ## Validation status
 
-- Compilation and GitHub CI: must pass before merging.
+- Initial strict Rust + Linux Docker CI on HEAD `07b598f3`: passed; the new preflight changes need a fresh CI run.
 - Integration with a real Telegram test group: **not done**.
 - Full Python Shield24 25-test behavioral parity: **not yet achieved**.
 - This is a new codebase, not a verified production deployment.
