@@ -124,6 +124,27 @@ impl Bot {
         Ok(matches!(result["status"].as_str(),Some("administrator"|"creator")))
     }
 
+    fn manual_admission(
+        &self, chat: i64, user: &User, flow: &str, delivery: i64, reason: &str,
+    ) -> Result<()> {
+        if let Some(existing)=self.store.get(chat,user.id)? {
+            if skip_existing(&existing,flow,now()) {
+                return Ok(());
+            }
+        }
+        let entry=Challenge {
+            chat_id:chat,user_id:user.id,
+            nonce:format!("{:016x}",rand::random::<u64>()),
+            flow:flow.into(),status:"manual".into(),
+            delivery_chat_id:delivery,answer:0,options:Vec::new(),
+            attempts:0,expires_at:now(),message_id:None,
+            action:None,updated_at:now(),
+        };
+        self.store.create(&entry)?;
+        self.store.audit(chat,user.id,"manual",reason)?;
+        Ok(())
+    }
+
     async fn challenge(&self, chat: i64, user: &User, flow: &str, delivery: i64) -> Result<()> {
         if user.is_bot || user.id==self.id { return Ok(()); }
         // Reconcile externally admitted users before checking group settings.
@@ -153,9 +174,18 @@ impl Bot {
         let settings=self.store.settings(chat)?;
         if !settings.enabled {return Ok(());}
         if flow=="member" {
-            let member=self.tg.call("getChatMember",json!({
+            let member=match self.tg.call("getChatMember",json!({
                 "chat_id":chat,"user_id":user.id
-            })).await?;
+            })).await {
+                Ok(member)=>member,
+                Err(error)=>{
+                    self.manual_admission(chat,user,flow,delivery,
+                        "unable to verify existing membership/administrator rights")?;
+                    tracing::error!(chat,user=user.id,error=%error,
+                        "new member requires administrator review");
+                    return Ok(());
+                }
+            };
             match member["status"].as_str() {
                 Some("administrator" | "creator")=>return Ok(()),
                 Some("restricted")=>{
@@ -253,11 +283,13 @@ impl Bot {
             return Ok(());
         }
         if request.query_id.is_some() {
-            tracing::warn!(chat=request.chat.id,"Guardian join requests are not implemented; keeping pending");
+            self.manual_admission(request.chat.id,&request.user,"request",
+                request.chat.id,"Guardian join request requires manual review")?;
             return Ok(());
         }
         let Some(delivery)=request.user_chat_id else {
-            self.store.audit(request.chat.id,request.user.id,"manual","missing user_chat_id")?;
+            self.manual_admission(request.chat.id,&request.user,"request",
+                request.chat.id,"missing user_chat_id; unable to send CAPTCHA")?;
             return Ok(());
         };
         self.challenge(request.chat.id,&request.user,"request",delivery).await
@@ -617,6 +649,45 @@ mod tests {
         bot.handle(update).await?;
         assert!(bot.store.event_counts(-100)?.contains(&("deleted".into(),1)));
         server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_member_lookup_failure_is_visible_in_pending_queue() -> Result<()> {
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":false,"error_code":403,"description":"Forbidden"})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/restrictChatMember"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/sendMessage"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        bot.challenge(-9,&User{id:901,is_bot:false},"member",-9).await?;
+        let pending=bot.store.list_open(-9,10)?;
+        assert_eq!(pending.len(),1);
+        assert_eq!(pending[0].status,"manual");
+        assert_eq!(pending[0].user_id,901);
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_request_without_temporary_dm_stays_in_manual_queue() -> Result<()> {
+        use crate::model::Chat;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock("http://127.0.0.1:9/botTEST/".into()));
+        bot.join(JoinRequest {
+            chat:Chat{id:-10},user:User{id:777,is_bot:false},
+            user_chat_id:None,query_id:None,date:now(),
+        }).await?;
+        let pending=bot.store.list_open(-10,10)?;
+        assert_eq!(pending.len(),1);
+        assert_eq!(pending[0].flow,"request");
+        assert_eq!(pending[0].status,"manual");
         Ok(())
     }
 
