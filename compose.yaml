@@ -7,5 +7,8 @@ services:
       DATABASE_PATH: /data/rebuild.sqlite3
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
-      - ./data:/data
+      - rebuild_data:/data
     init: true
+
+volumes:
+  rebuild_data:
