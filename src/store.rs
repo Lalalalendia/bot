@@ -34,7 +34,7 @@ pub struct Store {
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
         if path != ":memory:" {
-            if let Some(parent) = Path::new(path).parent() {
+            if let Some(parent) = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent).context("create DB directory")?;
             }
         }
