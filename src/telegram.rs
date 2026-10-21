@@ -21,9 +21,7 @@ fn safe_to_retry(method: &str) -> bool {
 
 impl Telegram {
     pub fn new(token: &str) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(40))
-            .build()?;
+        let client = Client::builder().timeout(Duration::from_secs(40)).build()?;
         Ok(Self {
             client,
             endpoint: format!("https://api.telegram.org/bot{token}/"),
@@ -44,7 +42,8 @@ impl Telegram {
     pub async fn call(&self, method: &str, body: Value) -> Result<Value> {
         let max_attempts = if safe_to_retry(method) { 4 } else { 1 };
         for attempt in 0..max_attempts {
-            let outcome = self.client
+            let outcome = self
+                .client
                 .post(format!("{}{}", self.endpoint, method))
                 .json(&body)
                 .send()
@@ -60,9 +59,7 @@ impl Telegram {
                         return Ok(data["result"].clone());
                     }
                     let status = data["error_code"].as_i64().unwrap_or(500);
-                    let description = data["description"]
-                        .as_str()
-                        .unwrap_or("unknown API error");
+                    let description = data["description"].as_str().unwrap_or("unknown API error");
                     let permanent = (400..500).contains(&status) && status != 429;
                     if permanent || attempt + 1 == max_attempts {
                         anyhow::bail!(
@@ -96,10 +93,9 @@ impl Telegram {
     }
 
     pub async fn send(&self, chat: i64, text: &str) -> Result<i64> {
-        let response = self.call(
-            "sendMessage",
-            json!({"chat_id": chat, "text": text}),
-        ).await?;
+        let response = self
+            .call("sendMessage", json!({"chat_id": chat, "text": text}))
+            .await?;
         response["message_id"]
             .as_i64()
             .context("sendMessage result missing message_id")
@@ -116,13 +112,24 @@ mod tests {
 
     #[test]
     fn retry_classification_is_explicit() {
-        for name in ["getUpdates", "getChat", "getChatMember", "getMe", "getWebhookInfo"] {
+        for name in [
+            "getUpdates",
+            "getChat",
+            "getChatMember",
+            "getMe",
+            "getWebhookInfo",
+        ] {
             assert!(safe_to_retry(name), "{name}");
         }
         for name in [
-            "sendMessage", "restrictChatMember", "banChatMember",
-            "approveChatJoinRequest", "declineChatJoinRequest",
-            "deleteMessage", "answerCallbackQuery", "deleteWebhook"
+            "sendMessage",
+            "restrictChatMember",
+            "banChatMember",
+            "approveChatJoinRequest",
+            "declineChatJoinRequest",
+            "deleteMessage",
+            "answerCallbackQuery",
+            "deleteWebhook",
         ] {
             assert!(!safe_to_retry(name), "{name}");
         }

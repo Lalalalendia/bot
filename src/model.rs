@@ -98,8 +98,15 @@ mod tests {
 
     #[test]
     fn restricted_user_requires_is_member() {
-        let user = User { id: 9, is_bot: false };
-        let mut member = Member { user, status: "restricted".into(), is_member: Some(false) };
+        let user = User {
+            id: 9,
+            is_bot: false,
+        };
+        let mut member = Member {
+            user,
+            status: "restricted".into(),
+            is_member: Some(false),
+        };
         assert!(!member.in_chat());
         member.is_member = Some(true);
         assert!(member.in_chat());
