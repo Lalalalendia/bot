@@ -162,9 +162,12 @@ impl Store {
     }
 
     pub fn wrong(&self, c: &Challenge, max: i64) -> Result<(i64,bool)> {
-        self.conn.execute("UPDATE challenges SET attempts=attempts+1,updated_at=?1
+        let updated=self.conn.execute("UPDATE challenges SET attempts=attempts+1,updated_at=?1
             WHERE chat_id=?2 AND user_id=?3 AND nonce=?4 AND status='pending'",
             params![now(),c.chat_id,c.user_id,c.nonce])?;
+        if updated==0 {
+            return Ok((0,false));
+        }
         let Some(fresh) = self.get(c.chat_id,c.user_id)? else { return Ok((0,false)); };
         let left = (max-fresh.attempts).max(0);
         Ok((left,left==0))
@@ -292,4 +295,64 @@ mod tests {
         assert_eq!(s.get(-10,44)?.unwrap().status,"passed");
         Ok(())
     }
+    #[test]
+    fn manual_override_survives_process_restart() -> Result<()> {
+        let file=std::env::temp_dir().join(format!(
+            "rebuild-admission-{}-{}.sqlite3",std::process::id(),rand::random::<u64>()
+        ));
+        let location=file.to_str().context("invalid path")?;
+        let initial=Store::open(location)?;
+        let c=Challenge {
+            chat_id:-101,user_id:72,nonce:"restart-safe".into(),
+            flow:"member".into(),status:"pending".into(),
+            delivery_chat_id:-101,answer:7,options:vec![5,7,9],
+            attempts:0,expires_at:now()+60,message_id:None,
+            action:None,updated_at:now(),
+        };
+        initial.create(&c)?;
+        initial.manual(&c,"Telegram API rejected restriction")?;
+        initial.offset_save(77)?;
+        drop(initial);
+
+        let after=Store::open(location)?;
+        assert_eq!(after.offset()?,77);
+        let review=after.get(-101,72)?.context("missing admission state")?;
+        assert_eq!(review.status,"manual");
+        assert!(after.manual_override(&review,"reject").is_err());
+        assert!(after.manual_override(&review,"pass")?);
+        assert!(!after.manual_override(&review,"pass")?);
+        let acting=after.get(-101,72)?.context("missing acting state")?;
+        assert_eq!(acting.action.as_deref(),Some("pass"));
+        after.finish(&acting,"passed")?;
+        let final_state=after.get(-101,72)?.context("missing passed state")?;
+        assert_eq!(final_state.status,"passed");
+        assert!(!after.manual_override(&final_state,"kick")?);
+        assert_eq!(after.event_counts(-101)?.iter().map(|(_,n)|n).sum::<i64>(),3);
+        drop(after);
+        std::fs::remove_file(&file)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_answer_requires_live_matching_nonce() -> Result<()> {
+        let store=Store::open(":memory:")?;
+        let c=Challenge {
+            chat_id:-5,user_id:51,nonce:"active".into(),
+            flow:"request".into(),status:"pending".into(),
+            delivery_chat_id:51,answer:8,options:vec![6,8,10],
+            attempts:0,expires_at:now()+60,message_id:None,
+            action:None,updated_at:now(),
+        };
+        store.create(&c)?;
+        let mut wrong=c.clone();
+        wrong.nonce="obsolete".into();
+        assert_eq!(store.wrong(&wrong,2)?,(0,false));
+        assert_eq!(store.wrong(&c,2)?,(1,false));
+        assert_eq!(store.wrong(&c,2)?,(0,true));
+        assert!(store.claim(&c,"reject")?);
+        assert_eq!(store.wrong(&c,2)?,(0,false));
+        assert_eq!(store.get(-5,51)?.unwrap().attempts,2);
+        Ok(())
+    }
+
 }
