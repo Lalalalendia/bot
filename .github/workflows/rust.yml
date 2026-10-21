@@ -13,29 +13,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  tests:
+  rust:
+    name: Format, Clippy, tests, release
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all
-      - name: Generate Cargo.lock
-        run: cargo generate-lockfile
+      - name: Check committed formatting
+        run: cargo fmt --all -- --check
+      - name: Check committed dependency lock
+        run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
         run: cargo test --locked --all-targets
-      - name: Publish checked Rust sources
-        uses: actions/upload-artifact@v4
-        with:
-          name: checked-rust-sources
-          path: |
-            Cargo.lock
-            src/
-          if-no-files-found: error
-          retention-days: 3
+      - name: Release build
+        run: cargo build --release --locked
+
+  docker:
+    name: Linux Docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        run: docker build --pull --tag rebuild-bot:ci .
