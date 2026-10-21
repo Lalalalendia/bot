@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_request_may_retry_a_temporary_error() {
+    async fn read_only_request_may_retry_a_temporary_error() -> Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let server = MockServer::start().await;
         let attempts = std::sync::Arc::new(AtomicUsize::new(0));
@@ -177,6 +177,6 @@ mod tests {
             .await?;
         assert_eq!(response["status"], "member");
         server.verify().await;
-        Ok::<(), anyhow::Error>(())
+        Ok(())
     }
 }
