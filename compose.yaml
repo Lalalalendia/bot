@@ -6,6 +6,7 @@ services:
       BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN in local env or ignored .env}
       DATABASE_PATH: /data/rebuild.sqlite3
       RUST_LOG: ${RUST_LOG:-info}
+      TEST_CHAT_ID: ${TEST_CHAT_ID:-}
     volumes:
       - rebuild_data:/data
     init: true
