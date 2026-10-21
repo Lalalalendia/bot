@@ -34,7 +34,7 @@ impl Telegram {
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
                 Err(e) => {
-                    if attempt==3 {return Err(e.into());}
+                    if attempt==3 {anyhow::bail!("Telegram transport failure: {}", e.status().map(|s|s.to_string()).unwrap_or_else(|| "network error".into()));}
                     tokio::time::sleep(Duration::from_secs(1u64 << attempt)).await;
                 }
             }
