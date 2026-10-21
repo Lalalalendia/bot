@@ -6,5 +6,6 @@
 *.sqlite3-shm
 *.sqlite3-wal
 *.lock.tmp
+*.instance.lock
 .idea/
 .vscode/
