@@ -1,0 +1,18 @@
+[package]
+name = "rebuild-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Rust Telegram community admission and moderation bot"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
