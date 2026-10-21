@@ -254,6 +254,26 @@ impl Store {
     /// Telegram confirmed membership outside our own join-request approval.
     /// This can happen when a moderator approves the request in Telegram itself.
     /// Do not decline an already-admitted member when the old CAPTCHA times out.
+    /// Close a pending challenge that no longer needs any Telegram API action.
+    /// Used only after independently checking current group membership.
+    pub fn close_without_action(
+        &self, c: &Challenge, status: &str, detail: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            matches!(status, "passed" | "failed"),
+            "invalid terminal challenge status",
+        );
+        let changed = self.conn.execute(
+            "UPDATE challenges SET status=?1,action=NULL,updated_at=?2
+             WHERE chat_id=?3 AND user_id=?4 AND nonce=?5 AND status='pending'",
+            params![status, now(), c.chat_id, c.user_id, c.nonce],
+        )?;
+        if changed == 1 {
+            self.audit(c.chat_id, c.user_id, status, detail)?;
+        }
+        Ok(changed == 1)
+    }
+
     pub fn resolve_external_approval(&self, c: &Challenge) -> Result<bool> {
         let changed = self.conn.execute(
             "UPDATE challenges SET status='passed',action=NULL,updated_at=?1
@@ -468,6 +488,25 @@ mod tests {
         assert_eq!(reopened.get(-42,8)?.unwrap().attempts,1);
         drop(reopened);
         std::fs::remove_file(&file)?;
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_noop_requires_pending_nonce() -> Result<()> {
+        let db=Store::open(":memory:")?;
+        let c=Challenge{
+            chat_id:-9,user_id:8,nonce:"nonce".into(),flow:"member".into(),
+            status:"pending".into(),delivery_chat_id:-9,answer:7,options:vec![7],
+            attempts:0,expires_at:now()-1,message_id:Some(200),action:None,updated_at:now(),
+        };
+        db.create(&c)?;
+        let mut stale=c.clone();
+        stale.nonce="old".into();
+        assert!(!db.close_without_action(&stale,"passed","external admin")?);
+        assert!(db.close_without_action(&c,"passed","external admin")?);
+        assert_eq!(db.get(-9,8)?.unwrap().status,"passed");
+        assert!(!db.close_without_action(&c,"failed","old timeout")?);
+        assert!(db.close_without_action(&c,"manual","bad").is_err());
         Ok(())
     }
 
