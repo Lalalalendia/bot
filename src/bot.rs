@@ -303,7 +303,9 @@ impl Bot {
                         let limit=self.store.settings(chat)?.max_attempts;
                         let (left,reject,fresh)=self.store.wrong_once(&state,limit,&c.id)?;
                         if fresh {
-                            if reject && self.store.claim(&state,if state.flow=="member"{"kick"}else{"reject"})? {
+                            if reject {
+                                // The transaction already reserved the terminal
+                                // action, so replay cannot turn failure into pass.
                                 self.perform(&state,if state.flow=="member"{"kick"}else{"reject"}).await?;
                             }
                             reply=if left==0 {"Попытки закончились"} else {"Неверный ответ"};
