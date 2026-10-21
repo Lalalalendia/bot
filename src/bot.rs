@@ -277,14 +277,26 @@ impl Bot {
                         if self.store.claim(&state,"pass")? {
                             self.perform(&state,"pass").await?;
                         }
-                        reply="Ответ принят";
+                        // A correct answer is not proof that Telegram actually
+                        // restored permissions or approved the request.
+                        let current=self.store.get(chat,user)?
+                            .context("challenge missing after acceptance")?;
+                        reply=if current.status=="passed" {
+                            "Проверка пройдена"
+                        } else {
+                            "Ответ правильный; требуется проверка администратора"
+                        };
                     } else {
                         let limit=self.store.settings(chat)?.max_attempts;
-                        let (left,reject)=self.store.wrong(&state,limit)?;
-                        if reject && self.store.claim(&state,if state.flow=="member"{"kick"}else{"reject"})? {
-                            self.perform(&state,if state.flow=="member"{"kick"}else{"reject"}).await?;
+                        let (left,reject,fresh)=self.store.wrong_once(&state,limit,&c.id)?;
+                        if fresh {
+                            if reject && self.store.claim(&state,if state.flow=="member"{"kick"}else{"reject"})? {
+                                self.perform(&state,if state.flow=="member"{"kick"}else{"reject"}).await?;
+                            }
+                            reply=if left==0 {"Попытки закончились"} else {"Неверный ответ"};
+                        } else {
+                            reply="Ответ уже обработан";
                         }
-                        reply=if left==0 {"Попытки закончились"} else {"Неверный ответ"};
                     }
                 }
             }
