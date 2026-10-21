@@ -20,6 +20,7 @@ pub struct Challenge {
     pub expires_at: i64,
     pub message_id: Option<i64>,
     pub action: Option<String>,
+    pub updated_at: i64,
 }
 
 pub struct Store {
@@ -108,7 +109,7 @@ impl Store {
     pub fn get(&self, chat: i64, user: i64) -> Result<Option<Challenge>> {
         let mut stmt = self.conn.prepare(
             "SELECT chat_id,user_id,nonce,flow,status,delivery_chat_id,answer,
-             options,attempts,expires_at,message_id,action
+             options,attempts,expires_at,message_id,action,updated_at
              FROM challenges WHERE chat_id=?1 AND user_id=?2",
         )?;
         let result = stmt.query_row(params![chat, user], |row| {
@@ -131,6 +132,7 @@ impl Store {
                 expires_at: row.get(9)?,
                 message_id: row.get(10)?,
                 action: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         }).optional()?;
         Ok(result)
@@ -277,7 +279,7 @@ mod tests {
         let s=Store::open(":memory:")?;
         let mut c=Challenge {chat_id:-10,user_id:44,nonce:"first".into(),flow:"member".into(),
             status:"pending".into(),delivery_chat_id:-10,answer:4,options:vec![4,9],
-            attempts:0,expires_at:now()+100,message_id:None,action:None};
+            attempts:0,expires_at:now()+100,message_id:None,action:None,updated_at:now()};
         s.create(&c)?;
         c.nonce="second".into();
         s.create(&c)?;
