@@ -166,13 +166,25 @@ impl Bot {
             }
         }
         if settings.lockdown {
-            if flow=="request" {
-                self.tg.call("declineChatJoinRequest",json!({"chat_id":chat,"user_id":user.id})).await?;
+            // Never blindly repeat an uncertain ban/decline after an API error.
+            self.store.audit(chat,user.id,"lockdown_attempt",flow)?;
+            let action=if flow=="request" {
+                self.tg.call("declineChatJoinRequest",json!({
+                    "chat_id":chat,"user_id":user.id
+                })).await
             } else {
-                self.tg.call("banChatMember",json!({"chat_id":chat,"user_id":user.id,
-                    "until_date":now()+60})).await?;
+                self.tg.call("banChatMember",json!({
+                    "chat_id":chat,"user_id":user.id,"until_date":now()+60
+                })).await
+            };
+            match action {
+                Ok(_)=>self.store.audit(chat,user.id,"lockdown",flow)?,
+                Err(error)=>{
+                    self.store.audit(chat,user.id,"manual","lockdown outcome unknown")?;
+                    tracing::error!(chat,user=user.id,error=%error,
+                        "manual verification of lockdown required");
+                }
             }
-            self.store.audit(chat,user.id,"lockdown",flow)?;
             return Ok(());
         }
         let a=rand::thread_rng().gen_range(1..=9);
@@ -447,8 +459,17 @@ impl Bot {
         if self.store.settings(m.chat.id)?.links
             && m.entities.iter().any(|entity|matches!(entity.kind.as_str(),"url"|"text_link"))
             && !self.admin(m.chat.id,sender.id).await? {
-            self.tg.call("deleteMessage",json!({"chat_id":m.chat.id,"message_id":m.message_id})).await?;
-            self.store.audit(m.chat.id,sender.id,"deleted","link")?;
+            self.store.audit(m.chat.id,sender.id,"delete_attempt","link")?;
+            match self.tg.call("deleteMessage",json!({
+                "chat_id":m.chat.id,"message_id":m.message_id
+            })).await {
+                Ok(_)=>self.store.audit(m.chat.id,sender.id,"deleted","link")?,
+                Err(error)=>{
+                    self.store.audit(m.chat.id,sender.id,"manual","link deletion outcome unknown")?;
+                    tracing::error!(chat=m.chat.id,message=m.message_id,error=%error,
+                        "manual verification of link deletion required");
+                }
+            }
         }
         Ok(())
     }
@@ -525,6 +546,35 @@ mod tests {
         assert_eq!(state.status,"passed");
         assert_eq!(state.flow,"request");
         assert_eq!(bot.store.list_open(-600,10)?.len(),0);
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_link_deletion_records_manual_without_redelivery() -> Result<()> {
+        use crate::model::{Chat, MessageEntity};
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"member"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/deleteMessage"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(
+                json!({"ok":false,"error_code":502,"description":"upstream unavailable"})
+            )).expect(1).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        bot.store.setting(-100,"links",1)?;
+        bot.message(Message {
+            message_id:222,chat:Chat{id:-100},date:now(),
+            sender:Some(User{id:17,is_bot:false}),
+            text:Some("http://example.org".into()),
+            new_chat_members:Vec::new(),
+            entities:vec![MessageEntity{kind:"url".into()}]
+        }).await?;
+        let events=bot.store.event_counts(-100)?;
+        assert!(events.contains(&("manual".to_string(),1)));
         server.verify().await;
         Ok(())
     }
