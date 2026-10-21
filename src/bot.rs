@@ -421,14 +421,22 @@ impl Bot {
     }
 
     async fn message(&self,m:Message)->Result<()> {
+        self.message_impl(m,false).await
+    }
+
+    async fn message_impl(&self,m:Message,edited:bool)->Result<()> {
         if stale_event(m.edit_date.unwrap_or(m.date), now()) {
             tracing::debug!(chat=m.chat.id, "Ignoring delayed message");
             return Ok(());
         }
-        for user in &m.new_chat_members {self.challenge(m.chat.id,user,"member",m.chat.id).await?;}
+        if !edited {
+            for user in &m.new_chat_members {
+                self.challenge(m.chat.id,user,"member",m.chat.id).await?;
+            }
+        }
         let Some(text)=m.text.as_deref().or(m.caption.as_deref()) else {return Ok(());};
         let Some(sender)=m.sender.as_ref() else {return Ok(());};
-        if text.starts_with('/') {
+        if !edited && text.starts_with('/') {
             let words:Vec<&str>=text.split_whitespace().collect();
             let command=words[0].split('@').next().unwrap_or("");
             if command=="/help" {
@@ -536,7 +544,7 @@ impl Bot {
         if let Some(request)=u.chat_join_request {return self.join(request).await;}
         if let Some(change)=u.chat_member {return self.member(change).await;}
         if let Some(c)=u.callback_query {return self.callback(c).await;}
-        if let Some(m)=u.edited_message {return self.message(m).await;}
+        if let Some(m)=u.edited_message {return self.message_impl(m,true).await;}
         if let Some(m)=u.message {return self.message(m).await;}
         Ok(())
     }
@@ -969,6 +977,34 @@ mod tests {
         assert_eq!(saved.status,"manual");
         assert_eq!(saved.flow,"request");
         assert!(saved.message_id.is_none());
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edited_admin_commands_are_not_executed() -> Result<()> {
+        use crate::model::Chat;
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/sendMessage"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        let edited=Message {
+            message_id:501,chat:Chat{id:-77},
+            date:now()-90,edit_date:Some(now()),
+            sender:Some(User{id:7,is_bot:false}),
+            text:Some("/guard off".into()),caption:None,
+            new_chat_members:Vec::new(),entities:Vec::new(),
+            caption_entities:Vec::new(),
+        };
+        bot.handle(Update {
+            update_id:3,message:None,edited_message:Some(edited),
+            callback_query:None,chat_member:None,chat_join_request:None,
+        }).await?;
+        assert!(bot.store.settings(-77)?.enabled);
         server.verify().await;
         Ok(())
     }
