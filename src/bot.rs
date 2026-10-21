@@ -113,7 +113,7 @@ impl Bot {
         let answer=a+b;
         let mut options: Vec<i64>=(2..=18).collect();
         options.shuffle(&mut rand::thread_rng());
-        options.truncate(8);
+        options.truncate(9);
         if !options.contains(&answer) { options.pop(); options.push(answer); }
         options.sort_unstable();
         let nonce=format!("{:016x}",rand::random::<u64>());
@@ -205,7 +205,7 @@ impl Bot {
         let mut reply="Проверка устарела";
         if user==c.user.id {
             if let Some(state)=self.store.get(chat,user)? {
-                if state.nonce==fields[3] && state.status=="pending" && state.expires_at>now() {
+                if state.nonce==fields[3] && state.status=="pending" && state.expires_at>now() && state.options.contains(&value) {
                     if value==state.answer {
                         if self.store.claim(&state,"pass")? {
                             self.perform(&state,"pass").await?;
@@ -455,6 +455,7 @@ mod tests {
         bot.challenge(-100,&member,"member",-100).await?;
         let c=bot.store.get(-100,42)?.context("CAPTCHA not stored")?;
         assert_eq!(c.status,"pending");
+        assert_eq!(c.options.len(),9);
         assert_eq!(c.message_id,Some(501));
 
         let data=format!("q:{}:{}:{}:{}",c.chat_id,c.user_id,c.nonce,c.answer);
