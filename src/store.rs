@@ -205,6 +205,22 @@ impl Store {
         Ok(())
     }
 
+    /// Telegram confirmed membership outside our own join-request approval.
+    /// This can happen when a moderator approves the request in Telegram itself.
+    /// Do not decline an already-admitted member when the old CAPTCHA times out.
+    pub fn resolve_external_approval(&self, c: &Challenge) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE challenges SET status='passed',action=NULL,updated_at=?1
+             WHERE chat_id=?2 AND user_id=?3 AND nonce=?4
+               AND flow='request' AND status IN ('pending','manual')",
+            params![now(),c.chat_id,c.user_id,c.nonce],
+        )?;
+        if changed == 1 {
+            self.audit(c.chat_id,c.user_id,"external_approval","member joined")?;
+        }
+        Ok(changed == 1)
+    }
+
     pub fn manual(&self, c: &Challenge, reason: &str) -> Result<()> {
         self.conn.execute("UPDATE challenges SET status='manual',updated_at=?1
             WHERE chat_id=?2 AND user_id=?3 AND nonce=?4 AND status IN ('pending','acting')",
@@ -348,6 +364,33 @@ mod tests {
         assert_eq!(after.event_counts(-101)?.iter().map(|(_,n)|n).sum::<i64>(),3);
         drop(after);
         std::fs::remove_file(&file)?;
+        Ok(())
+    }
+
+    #[test]
+    fn external_approval_cancels_request_timeout_and_cannot_override_acting() -> Result<()> {
+        let store=Store::open(":memory:")?;
+        let c=Challenge {
+            chat_id:-101,user_id:17,nonce:"request".into(),
+            flow:"request".into(),status:"pending".into(),
+            delivery_chat_id:17,answer:12,options:vec![9,12],
+            attempts:0,expires_at:now()-3,message_id:Some(200),
+            action:None,updated_at:now()-30,
+        };
+        store.create(&c)?;
+        assert!(store.resolve_external_approval(&c)?);
+        assert!(!store.resolve_external_approval(&c)?);
+        let done=store.get(-101,17)?.context("request not found")?;
+        assert_eq!(done.status,"passed");
+        assert!(store.claim(&done,"reject")? == false);
+
+        let mut another=c.clone();
+        another.nonce="second".to_owned();
+        another.user_id=18;
+        store.create(&another)?;
+        assert!(store.claim(&another,"reject")?);
+        assert!(!store.resolve_external_approval(&another)?);
+        assert_eq!(store.get(-101,18)?.unwrap().status,"acting");
         Ok(())
     }
 
