@@ -564,6 +564,7 @@ impl Bot {
     }
 
     async fn handle(&self,u:Update)->Result<()> {
+        tracing::trace!(update_id=u.update_id,"handling Telegram update");
         if let Some(request)=u.chat_join_request {return self.join(request).await;}
         if let Some(change)=u.chat_member {return self.member(change).await;}
         if let Some(c)=u.callback_query {return self.callback(c).await;}
