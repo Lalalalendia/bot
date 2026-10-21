@@ -76,6 +76,9 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS deadletters(
                update_id INTEGER PRIMARY KEY, at INTEGER NOT NULL, reason TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS processed_callbacks(
+               callback_id TEXT PRIMARY KEY, at INTEGER NOT NULL
              );"
         )?;
         Ok(Self { conn, _instance_lock: instance_lock })
@@ -177,16 +180,48 @@ impl Store {
         Ok(())
     }
 
-    pub fn wrong(&self, c: &Challenge, max: i64) -> Result<(i64,bool)> {
-        let updated=self.conn.execute("UPDATE challenges SET attempts=attempts+1,updated_at=?1
-            WHERE chat_id=?2 AND user_id=?3 AND nonce=?4 AND status='pending'",
-            params![now(),c.chat_id,c.user_id,c.nonce])?;
-        if updated==0 {
-            return Ok((0,false));
+    /// One Telegram callback may be delivered repeatedly after a restart
+    /// or timeout. Record its ID in the SAME transaction as the penalty.
+    /// Returns (remaining, limit_reached, newly_processed).
+    pub fn wrong_once(
+        &self, c: &Challenge, max: i64, callback_id: &str
+    ) -> Result<(i64, bool, bool)> {
+        if callback_id.is_empty() {
+            anyhow::bail!("callback_id must not be empty");
         }
-        let Some(fresh) = self.get(c.chat_id,c.user_id)? else { return Ok((0,false)); };
-        let left = (max-fresh.attempts).max(0);
-        Ok((left,left==0))
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(i64, bool, bool)> {
+            let inserted = self.conn.execute(
+                "INSERT OR IGNORE INTO processed_callbacks(callback_id,at)
+                 VALUES(?1,?2)",
+                params![callback_id,now()],
+            )?;
+            if inserted == 0 {
+                return Ok((0, false, false));
+            }
+            let updated = self.conn.execute(
+                "UPDATE challenges SET attempts=attempts+1,updated_at=?1
+                 WHERE chat_id=?2 AND user_id=?3 AND nonce=?4 AND status='pending'",
+                params![now(),c.chat_id,c.user_id,c.nonce],
+            )?;
+            if updated == 0 {
+                return Ok((0, false, false));
+            }
+            let fresh = self.get(c.chat_id,c.user_id)?
+                .context("challenge vanished after penalty")?;
+            let left = (max - fresh.attempts).max(0);
+            Ok((left, left == 0, true))
+        })();
+        match result {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Persist the intended external action before making a Telegram API request.
@@ -407,11 +442,12 @@ mod tests {
         store.create(&c)?;
         let mut wrong=c.clone();
         wrong.nonce="obsolete".into();
-        assert_eq!(store.wrong(&wrong,2)?,(0,false));
-        assert_eq!(store.wrong(&c,2)?,(1,false));
-        assert_eq!(store.wrong(&c,2)?,(0,true));
+        assert_eq!(store.wrong_once(&wrong,2,"cb-stale")?,(0,false,false));
+        assert_eq!(store.wrong_once(&c,2,"cb-1")?,(1,false,true));
+        assert_eq!(store.wrong_once(&c,2,"cb-1")?,(0,false,false));
+        assert_eq!(store.wrong_once(&c,2,"cb-2")?,(0,true,true));
         assert!(store.claim(&c,"reject")?);
-        assert_eq!(store.wrong(&c,2)?,(0,false));
+        assert_eq!(store.wrong_once(&c,2,"cb-3")?,(0,false,false));
         assert_eq!(store.get(-5,51)?.unwrap().attempts,2);
         Ok(())
     }
