@@ -106,16 +106,34 @@ impl Store {
     }
 
     pub fn get(&self, chat: i64, user: i64) -> Result<Option<Challenge>> {
-        let mut stmt = self.conn.prepare("SELECT chat_id,user_id,nonce,flow,status,delivery_chat_id,answer,options,attempts,expires_at,message_id,action FROM challenges WHERE chat_id=?1 AND user_id=?2")?;
-        let raw: Option<(i64,i64,String,String,String,i64,i64,String,i64,i64,Option<i64>,Option<String>)> =
-            stmt.query_row(params![chat,user], |r| Ok((
-                r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,
-                r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?
-            ))).optional()?;
-        raw.map(|(chat_id,user_id,nonce,flow,status,delivery_chat_id,answer,opts,attempts,expires_at,message_id,action)| {
-            Ok(Challenge {chat_id,user_id,nonce,flow,status,delivery_chat_id,answer,
-                options:serde_json::from_str(&opts)?,attempts,expires_at,message_id,action})
-        }).transpose()
+        let mut stmt = self.conn.prepare(
+            "SELECT chat_id,user_id,nonce,flow,status,delivery_chat_id,answer,
+             options,attempts,expires_at,message_id,action
+             FROM challenges WHERE chat_id=?1 AND user_id=?2",
+        )?;
+        let result = stmt.query_row(params![chat, user], |row| {
+            let encoded: String = row.get(7)?;
+            let options = serde_json::from_str(&encoded).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7, rusqlite::types::Type::Text, Box::new(err),
+                )
+            })?;
+            Ok(Challenge {
+                chat_id: row.get(0)?,
+                user_id: row.get(1)?,
+                nonce: row.get(2)?,
+                flow: row.get(3)?,
+                status: row.get(4)?,
+                delivery_chat_id: row.get(5)?,
+                answer: row.get(6)?,
+                options,
+                attempts: row.get(8)?,
+                expires_at: row.get(9)?,
+                message_id: row.get(10)?,
+                action: row.get(11)?,
+            })
+        }).optional()?;
+        Ok(result)
     }
 
     pub fn create(&self, c: &Challenge) -> Result<()> {
