@@ -417,7 +417,7 @@ mod tests {
         assert!(!store.resolve_external_approval(&c)?);
         let done=store.get(-101,17)?.context("request not found")?;
         assert_eq!(done.status,"passed");
-        assert!(store.claim(&done,"reject")? == false);
+        assert!(!store.claim(&done,"reject")?);
 
         let mut another=c.clone();
         another.nonce="second".to_owned();
@@ -426,6 +426,37 @@ mod tests {
         assert!(store.claim(&another,"reject")?);
         assert!(!store.resolve_external_approval(&another)?);
         assert_eq!(store.get(-101,18)?.unwrap().status,"acting");
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_callback_after_database_reopen_does_not_count_twice() -> Result<()> {
+        let file=std::env::temp_dir().join(format!(
+            "rebuild-callback-{}-{}.sqlite3",std::process::id(),rand::random::<u64>()
+        ));
+        let path=file.to_str().context("invalid temporary path")?;
+        let first=Store::open(path)?;
+        let c=Challenge {
+            chat_id:-42,user_id:8,nonce:"session".into(),
+            flow:"member".into(),status:"pending".into(),
+            delivery_chat_id:-42,answer:10,options:vec![5,10,11],
+            attempts:0,expires_at:now()+60,message_id:Some(3),
+            action:None,updated_at:now(),
+        };
+        first.create(&c)?;
+        assert_eq!(first.wrong_once(&c,2,"callback-unique")?,(1,false,true));
+        drop(first);
+
+        let reopened=Store::open(path)?;
+        let state=reopened.get(-42,8)?.context("lost challenge")?;
+        assert_eq!(state.attempts,1);
+        assert_eq!(
+            reopened.wrong_once(&state,2,"callback-unique")?,
+            (0,false,false)
+        );
+        assert_eq!(reopened.get(-42,8)?.unwrap().attempts,1);
+        drop(reopened);
+        std::fs::remove_file(&file)?;
         Ok(())
     }
 
