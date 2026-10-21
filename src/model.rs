@@ -18,6 +18,7 @@ pub struct Message {
     pub message_id: i64,
     pub chat: Chat,
     #[serde(default)]
+    #[allow(dead_code)]
     pub date: i64,
     #[serde(rename = "from")]
     pub sender: Option<User>,
