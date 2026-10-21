@@ -241,7 +241,7 @@ impl Bot {
             let words:Vec<&str>=text.split_whitespace().collect();
             let command=words[0].split('@').next().unwrap_or("");
             if command=="/help" {
-                self.tg.send(m.chat.id,"/help /status /guard on|off /links on|off /lockdown on|off /timeout 30..300 /attempts 1..5").await?;
+                self.tg.send(m.chat.id,"/help /status /guard on|off /links on|off /lockdown on|off /timeout 30..300 /attempts 1..5 /pending /allow ID /deny ID /stats").await?;
                 return Ok(());
             }
             if !self.admin(m.chat.id,sender.id).await? {return Ok(());}
@@ -251,6 +251,58 @@ impl Bot {
                     "Protection: {} | timeout: {}s | attempts: {} | links: {} | lockdown: {}",
                     s.enabled,s.timeout,s.max_attempts,s.links,s.lockdown
                 )).await?;
+                return Ok(());
+            }
+            if command=="/pending" {
+                let candidates=self.store.list_open(m.chat.id,12)?;
+                let summary=if candidates.is_empty() {
+                    "Ожидающих проверок нет".to_string()
+                } else {
+                    format!("Незавершённые проверки:\n{}",candidates.iter().map(|c|
+                        format!("{}: {} ({})",c.user_id,c.status,c.flow)
+                    ).collect::<Vec<_>>().join("\n"))
+                };
+                self.tg.send(m.chat.id,&summary).await?;
+                return Ok(());
+            }
+            if matches!(command,"/allow"|"/deny") {
+                let Some(target)=words.get(1).and_then(|id| id.parse::<i64>().ok())
+                    .filter(|id|*id>0) else {
+                    self.tg.send(m.chat.id,"Формат: /allow ID или /deny ID").await?;
+                    return Ok(());
+                };
+                let Some(pending)=self.store.get(m.chat.id,target)? else {
+                    self.tg.send(m.chat.id,"Ожидающей проверки для этого ID нет").await?;
+                    return Ok(());
+                };
+                let action=match (command,pending.flow.as_str()) {
+                    ("/allow",_)=>"pass",
+                    ("/deny","request")=>"reject",
+                    ("/deny","member")=>"kick",
+                    _=>anyhow::bail!("unknown flow"),
+                };
+                if self.store.manual_override(&pending,action)? {
+                    self.store.audit(m.chat.id,target,"admin_override",
+                        &format!("{} by {}",command,sender.id))?;
+                    self.perform(&pending,action).await?;
+                }
+                let state=self.store.get(m.chat.id,target)?.context("manual action lost")?;
+                self.tg.send(m.chat.id,&format!(
+                    "Статус {}: {}. Если manual или acting — проверьте вручную.",
+                    target,state.status
+                )).await?;
+                return Ok(());
+            }
+            if command=="/stats" {
+                let counts=self.store.event_counts(m.chat.id)?;
+                let summary=if counts.is_empty() {
+                    "Событий пока нет".to_string()
+                } else {
+                    format!("События группы:\n{}",counts.iter().map(|(event,n)|
+                        format!("{event}: {n}")
+                    ).collect::<Vec<_>>().join("\n"))
+                };
+                self.tg.send(m.chat.id,&summary).await?;
                 return Ok(());
             }
             let update=match (command,words.get(1).copied()) {
