@@ -62,14 +62,16 @@ pub struct Bot {
     store: Store,
     tg: Telegram,
     id: i64,
+    username: Option<String>,
 }
 
 impl Bot {
-    pub fn new(store: Store, tg: Telegram) -> Self { Self { store,tg,id:0 } }
+    pub fn new(store: Store, tg: Telegram) -> Self { Self { store,tg,id:0,username:None } }
 
     pub async fn run(mut self) -> Result<()> {
         let me=self.tg.call("getMe",json!({})).await.context("Bot token validation")?;
         self.id=me["id"].as_i64().context("getMe.id missing")?;
+        self.username=me["username"].as_str().map(str::to_owned);
         tracing::info!(bot_id=self.id,"polling initialized");
         // Do not destroy an existing webhook just because this binary started.
         // Switching delivery modes is an explicit administrator operation.
@@ -438,7 +440,17 @@ impl Bot {
         let Some(sender)=m.sender.as_ref() else {return Ok(());};
         if !edited && text.starts_with('/') {
             let words:Vec<&str>=text.split_whitespace().collect();
-            let command=words[0].split('@').next().unwrap_or("");
+            let command=match words[0].split_once('@') {
+                Some((cmd,recipient))=>{
+                    if recipient.is_empty() || !self.username.as_deref().is_some_and(
+                        |name| name.eq_ignore_ascii_case(recipient)
+                    ) {
+                        return Ok(());
+                    }
+                    cmd
+                }
+                None=>words[0],
+            };
             if command=="/help" {
                 self.tg.send(m.chat.id,"/help /status /guard on|off /links on|off /lockdown on|off /timeout 30..300 /attempts 1..5 /pending /allow ID /deny ID /stats").await?;
                 return Ok(());
@@ -1005,6 +1017,45 @@ mod tests {
             callback_query:None,chat_member:None,chat_join_request:None,
         }).await?;
         assert!(bot.store.settings(-77)?.enabled);
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commands_addressed_to_other_bots_are_ignored() -> Result<()> {
+        use crate::model::Chat;
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"administrator"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"message_id":15}})
+            )).expect(1).mount(&server).await;
+
+        let mut bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        bot.username=Some("RebuildExampleBot".into());
+        for text in ["/guard@AnotherBot off","/guard@ off"] {
+            bot.message(Message {
+                message_id:1,chat:Chat{id:-50},date:now(),
+                sender:Some(User{id:7,is_bot:false}),
+                text:Some(text.into()),caption:None,edit_date:None,
+                new_chat_members:Vec::new(),entities:Vec::new(),
+                caption_entities:Vec::new(),
+            }).await?;
+            assert!(bot.store.settings(-50)?.enabled);
+        }
+        bot.message(Message {
+            message_id:2,chat:Chat{id:-50},date:now(),
+            sender:Some(User{id:7,is_bot:false}),
+            text:Some("/guard@REBUILDEXAMPLEBOT off".into()),
+            caption:None,edit_date:None,new_chat_members:Vec::new(),
+            entities:Vec::new(),caption_entities:Vec::new(),
+        }).await?;
+        assert!(!bot.store.settings(-50)?.enabled);
         server.verify().await;
         Ok(())
     }
