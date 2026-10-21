@@ -90,15 +90,6 @@ impl Bot {
             self.store.audit(chat,user.id,"lockdown",flow)?;
             return Ok(());
         }
-        // Restrict first. If Telegram refuses, never leave a published CAPTCHA
-        // that gives the appearance of protection while allowing unrestricted chat.
-        if flow=="member" {
-            self.tg.call("restrictChatMember",json!({
-                "chat_id":chat,"user_id":user.id,
-                "permissions":{"can_send_messages":false},
-                "use_independent_chat_permissions":true
-            })).await?;
-        }
         let a=rand::thread_rng().gen_range(1..=9);
         let b=rand::thread_rng().gen_range(1..=9);
         let answer=a+b;
@@ -114,6 +105,23 @@ impl Bot {
             attempts:0,expires_at:now()+settings.timeout,message_id:None,action:None
         };
         self.store.create(&c)?;
+        // Persist the challenge before contacting Telegram. The row makes
+        // permission-denied failures visible to /pending, even after a restart.
+        // Restrict before delivering a challenge so no unrestricted window
+        // is created by the CAPTCHA itself.
+        if flow=="member" {
+            let result=self.tg.call("restrictChatMember",json!({
+                "chat_id":chat,"user_id":user.id,
+                "permissions":{"can_send_messages":false},
+                "use_independent_chat_permissions":true
+            })).await;
+            if let Err(e)=result {
+                self.store.manual(&c,&format!("restrict failed: {e}"))?;
+                tracing::error!(chat,user=user.id,error=%e,
+                    "Cannot restrict new member; admin attention required");
+                return Ok(());
+            }
+        }
         self.deliver(&c,a,b).await?;
         Ok(())
     }
