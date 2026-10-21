@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use fs2::FileExt;
+use std::fs::{File, OpenOptions};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{path::Path, time::{SystemTime, UNIX_EPOCH}};
 
@@ -25,6 +27,8 @@ pub struct Challenge {
 
 pub struct Store {
     conn: Connection,
+    // The operating-system lock stays alive for as long as the bot runs.
+    _instance_lock: Option<File>,
 }
 
 impl Store {
@@ -34,6 +38,18 @@ impl Store {
                 std::fs::create_dir_all(parent).context("create DB directory")?;
             }
         }
+        let instance_lock = if path == ":memory:" {
+            None
+        } else {
+            let file = OpenOptions::new()
+                .create(true).read(true).write(true)
+                .open(format!("{path}.instance.lock"))
+                .context("open bot instance lock")?;
+            file.try_lock_exclusive().context(
+                "another bot instance already owns this SQLite database"
+            )?;
+            Some(file)
+        };
         let conn = Connection::open(path).context("open SQLite")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
@@ -62,7 +78,7 @@ impl Store {
                update_id INTEGER PRIMARY KEY, at INTEGER NOT NULL, reason TEXT NOT NULL
              );"
         )?;
-        Ok(Self { conn })
+        Ok(Self { conn, _instance_lock: instance_lock })
     }
 
     pub fn offset(&self) -> Result<i64> {
@@ -302,6 +318,8 @@ mod tests {
         ));
         let location=file.to_str().context("invalid path")?;
         let initial=Store::open(location)?;
+        assert!(Store::open(location).is_err(),
+            "a second instance must not use the same live database");
         let c=Challenge {
             chat_id:-101,user_id:72,nonce:"restart-safe".into(),
             flow:"member".into(),status:"pending".into(),
