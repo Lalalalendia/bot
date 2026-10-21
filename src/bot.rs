@@ -422,6 +422,29 @@ impl Bot {
         Ok(())
     }
 
+    async fn moderate_links(&self, m: &Message, sender: &User) -> Result<bool> {
+        if !self.store.settings(m.chat.id)?.links
+            || !m.entities.iter().chain(m.caption_entities.iter())
+                .any(|entity|matches!(entity.kind.as_str(),"url"|"text_link"))
+            || self.admin(m.chat.id,sender.id).await?
+        {
+            return Ok(false);
+        }
+        self.store.audit(m.chat.id,sender.id,"delete_attempt","link")?;
+        match self.tg.call("deleteMessage",json!({
+            "chat_id":m.chat.id,"message_id":m.message_id
+        })).await {
+            Ok(_)=>self.store.audit(m.chat.id,sender.id,"deleted","link")?,
+            Err(error)=>{
+                self.store.audit(m.chat.id,sender.id,"manual","link deletion outcome unknown")?;
+                tracing::error!(chat=m.chat.id,message=m.message_id,error=%error,
+                    "manual verification of link deletion required");
+            }
+        }
+        // A URL-bearing command must not mutate settings after moderation.
+        Ok(true)
+    }
+
     async fn message(&self,m:Message)->Result<()> {
         self.message_impl(m,false).await
     }
@@ -438,6 +461,9 @@ impl Bot {
         }
         let Some(text)=m.text.as_deref().or(m.caption.as_deref()) else {return Ok(());};
         let Some(sender)=m.sender.as_ref() else {return Ok(());};
+        if self.moderate_links(&m,sender).await? {
+            return Ok(());
+        }
         if !edited && text.starts_with('/') {
             let words:Vec<&str>=text.split_whitespace().collect();
             let command=match words[0].split_once('@') {
@@ -533,21 +559,6 @@ impl Bot {
                 self.tg.send(m.chat.id,"Настройка сохранена").await?;
             }
             return Ok(());
-        }
-        if self.store.settings(m.chat.id)?.links
-            && m.entities.iter().chain(m.caption_entities.iter()).any(|entity|matches!(entity.kind.as_str(),"url"|"text_link"))
-            && !self.admin(m.chat.id,sender.id).await? {
-            self.store.audit(m.chat.id,sender.id,"delete_attempt","link")?;
-            match self.tg.call("deleteMessage",json!({
-                "chat_id":m.chat.id,"message_id":m.message_id
-            })).await {
-                Ok(_)=>self.store.audit(m.chat.id,sender.id,"deleted","link")?,
-                Err(error)=>{
-                    self.store.audit(m.chat.id,sender.id,"manual","link deletion outcome unknown")?;
-                    tracing::error!(chat=m.chat.id,message=m.message_id,error=%error,
-                        "manual verification of link deletion required");
-                }
-            }
         }
         Ok(())
     }
@@ -1056,6 +1067,46 @@ mod tests {
             entities:Vec::new(),caption_entities:Vec::new(),
         }).await?;
         assert!(!bot.store.settings(-50)?.enabled);
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn url_in_unknown_or_other_bot_command_is_still_filtered() -> Result<()> {
+        use crate::model::{Chat, MessageEntity};
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"member"}})
+            )).expect(2).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/deleteMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":true})
+            )).expect(2).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/sendMessage"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        bot.store.setting(-78,"links",1)?;
+        for (id, text) in [
+            (71,"/unknown https://example.org"),
+            (72,"/guard@OtherBot https://example.org"),
+        ] {
+            bot.message(Message {
+                message_id:id,chat:Chat{id:-78},date:now(),
+                sender:Some(User{id:8,is_bot:false}),
+                text:Some(text.into()),caption:None,edit_date:None,
+                new_chat_members:Vec::new(),
+                entities:vec![MessageEntity{kind:"url".into()}],
+                caption_entities:Vec::new(),
+            }).await?;
+        }
+        assert_eq!(
+            bot.store.event_counts(-78)?.iter().find(|(e,_)|e=="deleted")
+                .map(|(_,n)|*n),
+            Some(2),
+        );
         server.verify().await;
         Ok(())
     }
