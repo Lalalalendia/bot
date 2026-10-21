@@ -54,11 +54,13 @@ docker compose logs -f rebuild
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo build --release --locked
+docker build --tag rebuild-bot:local .
 ```
 
-CI проекта пока форматирует рабочую копию перед Clippy и тестами. Форматирование **в самой Git-ветке ещё надо привести к единому стандарту**.
+CI проверяет **зафиксированное в Git форматирование** (без автоматического исправления) и использует **зафиксированный `Cargo.lock`**. Отдельные обязательные проверки собирают release-бинарник и Linux Docker-образ. Исходники новой реализации не считаются прошедшими приёмку, пока все задания не завершатся успешно на одном HEAD.
 
 В тестах используются изолированная SQLite и локальный имитатор Telegram HTTP API. Они **не заменяют** испытания на реальной тестовой супергруппе.
 
