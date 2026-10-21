@@ -210,6 +210,17 @@ impl Store {
             let fresh = self.get(c.chat_id,c.user_id)?
                 .context("challenge vanished after penalty")?;
             let left = (max - fresh.attempts).max(0);
+            if left == 0 {
+                let action = if fresh.flow == "member" { "kick" } else { "reject" };
+                // Reaching the attempt limit must be atomic with the penalty:
+                // a crash here must not permit a later correct callback.
+                let n = self.conn.execute(
+                    "UPDATE challenges SET status='acting',action=?1,updated_at=?2
+                     WHERE chat_id=?3 AND user_id=?4 AND nonce=?5 AND status='pending'",
+                    params![action,now(),fresh.chat_id,fresh.user_id,fresh.nonce],
+                )?;
+                anyhow::ensure!(n == 1,"could not reserve rejection action");
+            }
             Ok((left, left == 0, true))
         })();
         match result {
@@ -477,7 +488,9 @@ mod tests {
         assert_eq!(store.wrong_once(&c,2,"cb-1")?,(1,false,true));
         assert_eq!(store.wrong_once(&c,2,"cb-1")?,(0,false,false));
         assert_eq!(store.wrong_once(&c,2,"cb-2")?,(0,true,true));
-        assert!(store.claim(&c,"reject")?);
+        assert_eq!(store.get(-5,51)?.unwrap().status,"acting");
+        assert_eq!(store.get(-5,51)?.unwrap().action.as_deref(),Some("reject"));
+        assert!(!store.claim(&c,"pass")?);
         assert_eq!(store.wrong_once(&c,2,"cb-3")?,(0,false,false));
         assert_eq!(store.get(-5,51)?.unwrap().attempts,2);
         Ok(())
