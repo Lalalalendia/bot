@@ -141,6 +141,7 @@ impl Bot {
     }
 
     async fn join(&self, request:JoinRequest)->Result<()> {
+        tracing::debug!(event_at=request.date,chat_id=request.chat.id,"join request received");
         if request.query_id.is_some() {
             tracing::warn!(chat=request.chat.id,"Guardian join requests are not implemented; keeping pending");
             return Ok(());
@@ -153,6 +154,7 @@ impl Bot {
     }
 
     async fn member(&self,change:MemberChange)->Result<()> {
+        tracing::debug!(event_at=change.date,chat_id=change.chat.id,"membership change received");
         if !change.old_chat_member.in_chat() && change.new_chat_member.in_chat() {
             self.challenge(change.chat.id,&change.new_chat_member.user,"member",change.chat.id).await?;
         }
