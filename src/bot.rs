@@ -8,6 +8,24 @@ use rand::{seq::SliceRandom, Rng};
 use serde_json::{json, Value};
 use std::{collections::HashMap, time::Duration};
 
+fn stale_event(event_at: i64, now_at: i64) -> bool {
+    event_at > 0 && now_at.saturating_sub(event_at) > 600
+}
+
+fn skip_existing(previous: &Challenge, new_flow: &str, now_at: i64) -> bool {
+    if matches!(previous.status.as_str(), "pending" | "acting" | "manual") {
+        return true;
+    }
+    // Telegram emits chat_member when a request is approved; never impose a
+    // second CAPTCHA on someone who just passed the pre-join verification.
+    if previous.status == "passed" && new_flow == "member" {
+        let elapsed = now_at.saturating_sub(previous.updated_at);
+        return (previous.flow == "request" && elapsed < 300)
+            || (previous.flow == "member" && elapsed < 12);
+    }
+    false
+}
+
 pub struct Bot {
     store: Store,
     tg: Telegram,
@@ -76,7 +94,7 @@ impl Bot {
         let settings=self.store.settings(chat)?;
         if !settings.enabled || self.admin(chat,user.id).await? {return Ok(());}
         if let Some(previous)=self.store.get(chat,user.id)? {
-            if matches!(previous.status.as_str(),"pending"|"acting"|"manual") {
+            if skip_existing(&previous,flow,now()) {
                 return Ok(());
             }
         }
@@ -102,7 +120,7 @@ impl Bot {
         let c=Challenge {
             chat_id:chat,user_id:user.id,nonce,flow:flow.into(),
             status:"pending".into(),delivery_chat_id:delivery,answer,options,
-            attempts:0,expires_at:now()+settings.timeout,message_id:None,action:None
+            attempts:0,expires_at:now()+settings.timeout,message_id:None,action:None,updated_at:now()
         };
         self.store.create(&c)?;
         // Persist the challenge before contacting Telegram. The row makes
@@ -150,6 +168,10 @@ impl Bot {
 
     async fn join(&self, request:JoinRequest)->Result<()> {
         tracing::debug!(event_at=request.date,chat_id=request.chat.id,"join request received");
+        if stale_event(request.date, now()) {
+            tracing::warn!(chat=request.chat.id, "Ignoring stale join request");
+            return Ok(());
+        }
         if request.query_id.is_some() {
             tracing::warn!(chat=request.chat.id,"Guardian join requests are not implemented; keeping pending");
             return Ok(());
@@ -163,6 +185,10 @@ impl Bot {
 
     async fn member(&self,change:MemberChange)->Result<()> {
         tracing::debug!(event_at=change.date,chat_id=change.chat.id,"membership change received");
+        if stale_event(change.date, now()) {
+            tracing::warn!(chat=change.chat.id, "Ignoring stale membership update");
+            return Ok(());
+        }
         if !change.old_chat_member.in_chat() && change.new_chat_member.in_chat() {
             self.challenge(change.chat.id,&change.new_chat_member.user,"member",change.chat.id).await?;
         }
@@ -242,6 +268,10 @@ impl Bot {
     }
 
     async fn message(&self,m:Message)->Result<()> {
+        if stale_event(m.date, now()) {
+            tracing::debug!(chat=m.chat.id, "Ignoring delayed message");
+            return Ok(());
+        }
         for user in &m.new_chat_members {self.challenge(m.chat.id,user,"member",m.chat.id).await?;}
         let Some(text)=m.text.as_deref() else {return Ok(());};
         let Some(sender)=m.sender.as_ref() else {return Ok(());};
@@ -373,7 +403,28 @@ mod tests {
     fn request_and_member_statuses() {
         let c=Challenge{chat_id:-1,user_id:3,nonce:"abc".into(),flow:"request".into(),
             status:"pending".into(),delivery_chat_id:3,answer:10,options:vec![10],
-            attempts:0,expires_at:now()+40,message_id:None,action:None};
+            attempts:0,expires_at:now()+40,message_id:None,action:None,updated_at:now()};
         assert_eq!(if c.flow=="member"{"kick"}else{"reject"},"reject");
+    }
+
+    #[test]
+    fn stale_updates_and_request_approval_grace() {
+        assert!(stale_event(100,701));
+        assert!(!stale_event(100,700));
+        let t = 5_000_i64;
+        let mut c = Challenge {
+            chat_id: -1, user_id: 42, nonce: "n".into(),
+            flow: "request".into(), status: "passed".into(),
+            delivery_chat_id: 42, answer: 5, options: vec![5],
+            attempts: 0, expires_at: t, message_id: None,
+            action: None, updated_at: t,
+        };
+        assert!(skip_existing(&c, "member", t+299));
+        assert!(!skip_existing(&c, "member", t+301));
+        c.flow = "member".into();
+        assert!(skip_existing(&c, "member", t+11));
+        assert!(!skip_existing(&c, "member", t+13));
+        c.status = "manual".into();
+        assert!(skip_existing(&c, "member", t+1000));
     }
 }
