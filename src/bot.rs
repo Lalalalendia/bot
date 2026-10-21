@@ -427,4 +427,78 @@ mod tests {
         c.status = "manual".into();
         assert!(skip_existing(&c, "member", t+1000));
     }
+    #[tokio::test]
+    async fn live_http_mock_restrict_challenge_then_unrestrict() -> Result<()> {
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        let success=ResponseTemplate::new(200).set_body_json(
+            json!({"ok":true,"result":true})
+        );
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"member"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/restrictChatMember"))
+            .respond_with(success.clone()).expect(2).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"message_id":501}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/answerCallbackQuery"))
+            .respond_with(success.clone()).expect(2).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/deleteMessage"))
+            .respond_with(success).expect(1).mount(&server).await;
+
+        let tg=Telegram::mock(format!("{}/botTEST/",server.uri()));
+        let bot=Bot::new(Store::open(":memory:")?,tg);
+        let member=User{id:42,is_bot:false};
+        bot.challenge(-100,&member,"member",-100).await?;
+        let c=bot.store.get(-100,42)?.context("CAPTCHA not stored")?;
+        assert_eq!(c.status,"pending");
+        assert_eq!(c.message_id,Some(501));
+
+        let data=format!("q:{}:{}:{}:{}",c.chat_id,c.user_id,c.nonce,c.answer);
+        bot.callback(Callback {
+            id:"other-user".into(),
+            user:User{id:101,is_bot:false},
+            data:Some(data.clone()),
+        }).await?;
+        assert_eq!(bot.store.get(-100,42)?.unwrap().status,"pending");
+
+        bot.callback(Callback {
+            id:"correct-user".into(),
+            user:member,
+            data:Some(data),
+        }).await?;
+        assert_eq!(bot.store.get(-100,42)?.unwrap().status,"passed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_forbidden_records_manual_without_fake_challenge() -> Result<()> {
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"member"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/restrictChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":false,"error_code":403,"description":"Not enough permissions"})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"message_id":88}})
+            )).expect(0).mount(&server).await;
+
+        let tg=Telegram::mock(format!("{}/botTEST/",server.uri()));
+        let bot=Bot::new(Store::open(":memory:")?,tg);
+        bot.challenge(-100,&User{id:43,is_bot:false},"member",-100).await?;
+        let c=bot.store.get(-100,43)?.context("manual state missing")?;
+        assert_eq!(c.status,"manual");
+        assert!(c.message_id.is_none());
+        assert_eq!(bot.store.list_open(-100,10)?.len(),1);
+        Ok(())
+    }
+
 }
