@@ -84,7 +84,7 @@ impl Bot {
             let offset=self.store.offset()?;
             match self.tg.call("getUpdates",json!({
                 "offset":offset,"limit":50,"timeout":25,
-                "allowed_updates":["message","callback_query","chat_member","chat_join_request"]
+                "allowed_updates":["message","edited_message","callback_query","chat_member","chat_join_request"]
             })).await {
                 Ok(raw)=>{
                     poll_errors=0;
@@ -366,12 +366,12 @@ impl Bot {
     }
 
     async fn message(&self,m:Message)->Result<()> {
-        if stale_event(m.date, now()) {
+        if stale_event(m.edit_date.unwrap_or(m.date), now()) {
             tracing::debug!(chat=m.chat.id, "Ignoring delayed message");
             return Ok(());
         }
         for user in &m.new_chat_members {self.challenge(m.chat.id,user,"member",m.chat.id).await?;}
-        let Some(text)=m.text.as_deref() else {return Ok(());};
+        let Some(text)=m.text.as_deref().or(m.caption.as_deref()) else {return Ok(());};
         let Some(sender)=m.sender.as_ref() else {return Ok(());};
         if text.starts_with('/') {
             let words:Vec<&str>=text.split_whitespace().collect();
@@ -460,7 +460,7 @@ impl Bot {
             return Ok(());
         }
         if self.store.settings(m.chat.id)?.links
-            && m.entities.iter().any(|entity|matches!(entity.kind.as_str(),"url"|"text_link"))
+            && m.entities.iter().chain(m.caption_entities.iter()).any(|entity|matches!(entity.kind.as_str(),"url"|"text_link"))
             && !self.admin(m.chat.id,sender.id).await? {
             self.store.audit(m.chat.id,sender.id,"delete_attempt","link")?;
             match self.tg.call("deleteMessage",json!({
@@ -481,6 +481,7 @@ impl Bot {
         if let Some(request)=u.chat_join_request {return self.join(request).await;}
         if let Some(change)=u.chat_member {return self.member(change).await;}
         if let Some(c)=u.callback_query {return self.callback(c).await;}
+        if let Some(m)=u.edited_message {return self.message(m).await;}
         if let Some(m)=u.message {return self.message(m).await;}
         Ok(())
     }
@@ -573,11 +574,48 @@ mod tests {
             message_id:222,chat:Chat{id:-100},date:now(),
             sender:Some(User{id:17,is_bot:false}),
             text:Some("http://example.org".into()),
+            caption:None,edit_date:None,
             new_chat_members:Vec::new(),
-            entities:vec![MessageEntity{kind:"url".into()}]
+            entities:vec![MessageEntity{kind:"url".into()}],
+            caption_entities:Vec::new()
         }).await?;
         let events=bot.store.event_counts(-100)?;
         assert!(events.contains(&("manual".to_string(),1)));
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edited_caption_link_is_checked_at_edit_time() -> Result<()> {
+        use crate::model::{Chat, MessageEntity};
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"member"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/deleteMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":true})
+            )).expect(1).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        bot.store.setting(-100,"links",1)?;
+        let message=Message {
+            message_id:250,chat:Chat{id:-100},
+            date:now()-900,edit_date:Some(now()),
+            sender:Some(User{id:19,is_bot:false}),
+            text:None,caption:Some("see description".into()),
+            new_chat_members:Vec::new(),
+            entities:Vec::new(),
+            caption_entities:vec![MessageEntity{kind:"text_link".into()}],
+        };
+        let update=Update {
+            update_id:999,message:None,edited_message:Some(message),
+            callback_query:None,chat_member:None,chat_join_request:None,
+        };
+        bot.handle(update).await?;
+        assert!(bot.store.event_counts(-100)?.contains(&("deleted".into(),1)));
         server.verify().await;
         Ok(())
     }
