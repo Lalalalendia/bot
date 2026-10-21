@@ -831,6 +831,59 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn expired_unapproved_join_request_is_declined_once() -> Result<()> {
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"left"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/declineChatJoinRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":true})
+            )).expect(1).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        let c=Challenge {
+            chat_id:-101,user_id:70,nonce:"still-pending".into(),flow:"request".into(),
+            status:"pending".into(),delivery_chat_id:70,answer:9,options:vec![9],
+            attempts:0,expires_at:now()-10,message_id:None,
+            action:None,updated_at:now()-80,
+        };
+        bot.store.create(&c)?;
+        bot.sweep().await?;
+        bot.sweep().await?;
+        assert_eq!(bot.store.get(-101,70)?.unwrap().status,"failed");
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timeout_membership_lookup_failure_never_bans_user() -> Result<()> {
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":false,"error_code":403,"description":"Forbidden"})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/banChatMember"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        let c=Challenge {
+            chat_id:-101,user_id:71,nonce:"unknown-membership".into(),flow:"member".into(),
+            status:"pending".into(),delivery_chat_id:-101,answer:8,options:vec![8],
+            attempts:0,expires_at:now()-10,message_id:Some(11),
+            action:None,updated_at:now()-80,
+        };
+        bot.store.create(&c)?;
+        bot.sweep().await?;
+        assert_eq!(bot.store.get(-101,71)?.unwrap().status,"manual");
+        server.verify().await;
+        Ok(())
+    }
+
     #[test]
     fn restores_only_existing_group_permissions() -> Result<()> {
         let source=json!({"permissions":{
