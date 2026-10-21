@@ -130,20 +130,21 @@ impl Bot {
         // Telegram can send chat_member when a moderator approved a pending
         // join request directly in the Telegram interface.
         if let Some(previous) = self.store.get(chat,user.id)? {
-            if flow=="member" && previous.flow=="request"
-                && matches!(previous.status.as_str(),"pending"|"manual") {
-                if self.store.resolve_external_approval(&previous)? {
-                    if let Some(message)=previous.message_id {
-                        if let Err(error)=self.tg.call("deleteMessage",json!({
-                            "chat_id":previous.delivery_chat_id,
-                            "message_id":message
-                        })).await {
-                            tracing::debug!(chat,user=user.id,error=%error,
-                                "could not clean up externally approved CAPTCHA");
-                        }
+            if flow=="member"
+                && previous.flow=="request"
+                && matches!(previous.status.as_str(),"pending"|"manual")
+                && self.store.resolve_external_approval(&previous)?
+            {
+                if let Some(message)=previous.message_id {
+                    if let Err(error)=self.tg.call("deleteMessage",json!({
+                        "chat_id":previous.delivery_chat_id,
+                        "message_id":message
+                    })).await {
+                        tracing::debug!(chat,user=user.id,error=%error,
+                            "could not clean up externally approved CAPTCHA");
                     }
-                    return Ok(());
                 }
+                return Ok(());
             }
             if skip_existing(&previous,flow,now()) {
                 return Ok(());
