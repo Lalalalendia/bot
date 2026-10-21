@@ -18,10 +18,14 @@ fn skip_existing(previous: &Challenge, new_flow: &str, now_at: i64) -> bool {
     }
     // Telegram emits chat_member when a request is approved; never impose a
     // second CAPTCHA on someone who just passed the pre-join verification.
-    if previous.status == "passed" && new_flow == "member" {
+    if previous.status == "passed" {
         let elapsed = now_at.saturating_sub(previous.updated_at);
-        return (previous.flow == "request" && elapsed < 300)
-            || (previous.flow == "member" && elapsed < 12);
+        if previous.flow == "request" && elapsed < 300 {
+            return matches!(new_flow, "member" | "request");
+        }
+        if previous.flow == "member" && new_flow == "member" && elapsed < 12 {
+            return true;
+        }
     }
     false
 }
@@ -122,25 +126,43 @@ impl Bot {
 
     async fn challenge(&self, chat: i64, user: &User, flow: &str, delivery: i64) -> Result<()> {
         if user.is_bot || user.id==self.id { return Ok(()); }
-        let settings=self.store.settings(chat)?;
-        if !settings.enabled {return Ok(());}
-        let member=self.tg.call("getChatMember",json!({
-            "chat_id":chat,"user_id":user.id
-        })).await?;
-        match member["status"].as_str() {
-            Some("administrator" | "creator")=>return Ok(()),
-            // Someone already under an individual sanction must never gain
-            // broader rights by solving a new-member challenge.
-            Some("restricted") if flow=="member"=>{
-                self.store.audit(chat,user.id,"manual","existing restrictions")?;
-                return Ok(());
+        // Reconcile externally admitted users before checking group settings.
+        // Telegram can send chat_member when a moderator approved a pending
+        // join request directly in the Telegram interface.
+        if let Some(previous) = self.store.get(chat,user.id)? {
+            if flow=="member" && previous.flow=="request"
+                && matches!(previous.status.as_str(),"pending"|"manual") {
+                if self.store.resolve_external_approval(&previous)? {
+                    if let Some(message)=previous.message_id {
+                        if let Err(error)=self.tg.call("deleteMessage",json!({
+                            "chat_id":previous.delivery_chat_id,
+                            "message_id":message
+                        })).await {
+                            tracing::debug!(chat,user=user.id,error=%error,
+                                "could not clean up externally approved CAPTCHA");
+                        }
+                    }
+                    return Ok(());
+                }
             }
-            Some("left" | "kicked") if flow=="member"=>return Ok(()),
-            _=>{}
-        }
-        if let Some(previous)=self.store.get(chat,user.id)? {
             if skip_existing(&previous,flow,now()) {
                 return Ok(());
+            }
+        }
+        let settings=self.store.settings(chat)?;
+        if !settings.enabled {return Ok(());}
+        if flow=="member" {
+            let member=self.tg.call("getChatMember",json!({
+                "chat_id":chat,"user_id":user.id
+            })).await?;
+            match member["status"].as_str() {
+                Some("administrator" | "creator")=>return Ok(()),
+                Some("restricted")=>{
+                    self.store.audit(chat,user.id,"manual","existing restrictions")?;
+                    return Ok(());
+                }
+                Some("left" | "kicked")=>return Ok(()),
+                _=>{}
             }
         }
         if settings.lockdown {
@@ -447,6 +469,53 @@ impl Bot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn external_join_approval_closes_pending_request_without_second_captcha() -> Result<()> {
+        use crate::model::{Chat, Member};
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"message_id":301}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/deleteMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":true})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"member"}})
+            )).expect(0).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/restrictChatMember"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        let member=User{id:55,is_bot:false};
+        bot.join(JoinRequest {
+            chat:Chat{id:-600},user:member.clone(),
+            user_chat_id:Some(55),query_id:None,date:now()
+        }).await?;
+        assert_eq!(bot.store.get(-600,55)?.unwrap().status,"pending");
+
+        bot.member(MemberChange {
+            chat:Chat{id:-600},date:now(),
+            old_chat_member:Member {
+                user:member.clone(),status:"left".into(),is_member:None
+            },
+            new_chat_member:Member {
+                user:member,status:"member".into(),is_member:None
+            },
+        }).await?;
+        let state=bot.store.get(-600,55)?.context("missing approved request")?;
+        assert_eq!(state.status,"passed");
+        assert_eq!(state.flow,"request");
+        assert_eq!(bot.store.list_open(-600,10)?.len(),0);
+        server.verify().await;
+        Ok(())
+    }
 
     #[test]
     fn restores_only_existing_group_permissions() -> Result<()> {
