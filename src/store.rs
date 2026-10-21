@@ -198,6 +198,46 @@ impl Store {
         Ok(())
     }
 
+    /// Manual overrides may only replace a pending/manual admission decision.
+    /// Never overwrite an in-flight external action: its outcome may be unknown.
+    pub fn manual_override(&self, c: &Challenge, action: &str) -> Result<bool> {
+        if !matches!(
+            (c.flow.as_str(), action),
+            ("member", "pass" | "kick") | ("request", "pass" | "reject")
+        ) {
+            anyhow::bail!("invalid manual action for admission flow");
+        }
+        let affected = self.conn.execute(
+            "UPDATE challenges SET status='acting',action=?1,updated_at=?2
+             WHERE chat_id=?3 AND user_id=?4 AND nonce=?5
+               AND status IN ('pending','manual')",
+            params![action, now(), c.chat_id, c.user_id, c.nonce],
+        )?;
+        Ok(affected == 1)
+    }
+
+    pub fn list_open(&self, chat: i64, limit: usize) -> Result<Vec<Challenge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT user_id FROM challenges WHERE chat_id=?1
+             AND status IN ('pending','acting','manual')
+             ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+        let ids = stmt.query_map(params![chat, limit as i64], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter().map(|user| {
+            self.get(chat, user)?.context("open challenge disappeared")
+        }).collect()
+    }
+
+    pub fn event_counts(&self, chat: i64) -> Result<Vec<(String, i64)>> {
+        let mut stmt=self.conn.prepare(
+            "SELECT event,count(*) FROM audit WHERE chat_id=?1 GROUP BY event"
+        )?;
+        let counts=stmt.query_map([chat],|r| Ok((r.get(0)?,r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(counts)
+    }
+
     pub fn open_challenges(&self) -> Result<Vec<Challenge>> {
         let mut stmt=self.conn.prepare("SELECT chat_id,user_id FROM challenges WHERE status IN ('pending','acting','manual')")?;
         let keys=stmt.query_map([],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?)))?
