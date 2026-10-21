@@ -15,6 +15,14 @@ impl Telegram {
         Ok(Self {client,endpoint: format!("https://api.telegram.org/bot{token}/")})
     }
 
+    #[cfg(test)]
+    pub fn mock(endpoint: String) -> Self {
+        Self {
+            client: Client::builder().timeout(Duration::from_secs(4)).build().unwrap(),
+            endpoint,
+        }
+    }
+
     pub async fn call(&self, method: &str, body: Value) -> Result<Value> {
         for attempt in 0..4 {
             let outcome = self.client.post(format!("{}{}",self.endpoint,method))
