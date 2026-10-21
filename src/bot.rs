@@ -541,15 +541,60 @@ impl Bot {
         Ok(())
     }
 
+    async fn expire(&self, c: &Challenge) -> Result<()> {
+        // Reconcile current Telegram membership before punishing a user for
+        // an old CAPTCHA. Moderators may have intervened while the bot was off.
+        let membership=match self.tg.call("getChatMember",json!({
+            "chat_id":c.chat_id,"user_id":c.user_id
+        })).await {
+            Ok(m)=>m,
+            Err(error)=>{
+                self.store.manual(c,"unable to verify current member state at expiry")?;
+                tracing::warn!(chat=c.chat_id,user=c.user_id,error=%error,
+                    "expired admission requires manual verification");
+                return Ok(());
+            }
+        };
+        let status=membership["status"].as_str();
+        let active=matches!(status,Some("member"|"administrator"|"creator"))
+            || (status==Some("restricted") && membership["is_member"]==true);
+        let privileged=matches!(status,Some("administrator"|"creator"));
+        let gone=matches!(status,Some("left"|"kicked"));
+        if c.flow=="request" && active {
+            self.store.resolve_external_approval(c)?;
+            return Ok(());
+        }
+        if c.flow=="member" && privileged {
+            self.store.close_without_action(c,"passed","member promoted externally")?;
+            return Ok(());
+        }
+        if c.flow=="member" && gone {
+            self.store.close_without_action(c,"failed","member already left")?;
+            return Ok(());
+        }
+        if c.flow=="request" && status==Some("kicked") {
+            self.store.close_without_action(c,"failed","join request already blocked")?;
+            return Ok(());
+        }
+        if (c.flow=="request" && status!=Some("left"))
+            || (c.flow=="member" && !active)
+        {
+            self.store.manual(c,"unexpected Telegram membership status at expiry")?;
+            return Ok(());
+        }
+        let action=if c.flow=="member"{"kick"}else{"reject"};
+        if self.store.claim(c,action)? {
+            self.perform(c,action).await?;
+        }
+        Ok(())
+    }
+
     async fn sweep(&self)->Result<()> {
         for c in self.store.open_challenges()? {
             if c.status=="acting" {
                 self.store.manual(&c,"uncertain previous API action, verify manually")?;
             } else if c.status=="pending" && c.expires_at<=now() {
-                let action=if c.flow=="member"{"kick"}else{"reject"};
-                if self.store.claim(&c,action)? {
-                    self.perform(&c,action).await?;
-                }
+                self.expire(&c).await?;
             } else if c.status=="pending" && c.message_id.is_none() {
                 self.store.manual(&c,"delivery not confirmed before restart")?;
             }
@@ -733,6 +778,56 @@ mod tests {
         }))?.context("valid event lost")?;
         assert_eq!(next.update_id,502);
         assert_eq!(bot.store.offset()?,502);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_request_already_approved_is_not_declined() -> Result<()> {
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"member"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/declineChatJoinRequest"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        let pending=Challenge {
+            chat_id:-100,user_id:56,nonce:"from-downtime".into(),
+            flow:"request".into(),status:"pending".into(),delivery_chat_id:56,
+            answer:12,options:vec![12],attempts:0,expires_at:now()-30,
+            message_id:Some(5),action:None,updated_at:now()-90,
+        };
+        bot.store.create(&pending)?;
+        bot.sweep().await?;
+        assert_eq!(bot.store.get(-100,56)?.unwrap().status,"passed");
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_member_promoted_to_admin_is_not_banned() -> Result<()> {
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"status":"administrator"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/banChatMember"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        let pending=Challenge {
+            chat_id:-100,user_id:57,nonce:"promoted".into(),
+            flow:"member".into(),status:"pending".into(),delivery_chat_id:-100,
+            answer:12,options:vec![12],attempts:0,expires_at:now()-30,
+            message_id:Some(6),action:None,updated_at:now()-90,
+        };
+        bot.store.create(&pending)?;
+        bot.sweep().await?;
+        assert_eq!(bot.store.get(-100,57)?.unwrap().status,"passed");
+        server.verify().await;
         Ok(())
     }
 
