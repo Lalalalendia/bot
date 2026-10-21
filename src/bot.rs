@@ -88,10 +88,17 @@ impl Bot {
             })).await {
                 Ok(raw)=>{
                     poll_errors=0;
-                    let updates: Vec<Update>=serde_json::from_value(raw).context("updates JSON")?;
-                    for update in updates {
-                        if update.update_id<self.store.offset()? {continue;}
-                        let id=update.update_id;
+                    let updates: Vec<Value>=serde_json::from_value(raw)
+                        .context("Telegram getUpdates returned a non-array")?;
+                    for event in updates {
+                        let id=event["update_id"].as_i64()
+                            .context("Telegram update missing numeric update_id")?;
+                        if id<self.store.offset()? {continue;}
+                        let Some(update)=self.decode_update(event)? else {
+                            // The individual malformed update is quarantined.
+                            // Remaining updates in the same batch still progress.
+                            continue;
+                        };
                         match self.handle(update).await {
                             Ok(())=>{self.store.offset_save(id+1)?;failures.remove(&id);},
                             Err(err)=>{
@@ -115,6 +122,22 @@ impl Bot {
                     tracing::warn!(error=%e,"poll error");
                     tokio::time::sleep(Duration::from_secs(2u64.pow(poll_errors.min(5)))).await;
                 }
+            }
+        }
+    }
+
+    fn decode_update(&self, event: Value) -> Result<Option<Update>> {
+        let id=event["update_id"].as_i64()
+            .context("Telegram update missing update_id")?;
+        match serde_json::from_value(event) {
+            Ok(update)=>Ok(Some(update)),
+            Err(error)=>{
+                // Do not let a single malformed event stop the poller or
+                // prevent subsequent independent updates from being processed.
+                self.store.deadletter(id,&format!("update decode failed: {error}"))?;
+                self.store.offset_save(id+1)?;
+                tracing::warn!(update_id=id,error=%error,"invalid Telegram update quarantined");
+                Ok(None)
             }
         }
     }
@@ -688,6 +711,28 @@ mod tests {
         assert_eq!(pending.len(),1);
         assert_eq!(pending[0].flow,"request");
         assert_eq!(pending[0].status,"manual");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_update_is_deadlettered_without_stopping_next_event() -> Result<()> {
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock("http://127.0.0.1:9/botTEST/".into()));
+        let invalid=json!({
+            "update_id":501,
+            "message":{"message_id":1,"chat":{"id":"not a number"}}
+        });
+        assert!(bot.decode_update(invalid)?.is_none());
+        assert_eq!(bot.store.offset()?,502);
+        let next=bot.decode_update(json!({
+            "update_id":502,
+            "message":{
+                "message_id":99,"date":now(),"chat":{"id":-4},
+                "from":{"id":6,"is_bot":false},"text":"hello"
+            }
+        }))?.context("valid event lost")?;
+        assert_eq!(next.update_id,502);
+        assert_eq!(bot.store.offset()?,502);
         Ok(())
     }
 
