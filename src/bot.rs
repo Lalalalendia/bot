@@ -26,6 +26,34 @@ fn skip_existing(previous: &Challenge, new_flow: &str, now_at: i64) -> bool {
     false
 }
 
+/// Never elevate a member beyond the group defaults when CAPTCHA is passed.
+/// Missing group permission information is a manual-review condition, not
+/// permission to enable all message types.
+fn default_chat_permissions(chat: &Value) -> Result<Value> {
+    let source = chat["permissions"]
+        .as_object()
+        .context("getChat did not return default group permissions")?;
+    let mut permissions = serde_json::Map::new();
+    for field in [
+        "can_send_messages", "can_send_audios", "can_send_documents",
+        "can_send_photos", "can_send_videos", "can_send_video_notes",
+        "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+        "can_add_web_page_previews", "can_change_info", "can_invite_users",
+        "can_pin_messages", "can_manage_topics",
+    ] {
+        if let Some(value) = source.get(field) {
+            if !value.is_boolean() {
+                anyhow::bail!("invalid group permission type");
+            }
+            permissions.insert(field.to_string(), value.clone());
+        }
+    }
+    if permissions.is_empty() {
+        anyhow::bail!("group permissions are absent; manual review required");
+    }
+    Ok(Value::Object(permissions))
+}
+
 pub struct Bot {
     store: Store,
     tg: Telegram,
@@ -39,9 +67,12 @@ impl Bot {
         let me=self.tg.call("getMe",json!({})).await.context("Bot token validation")?;
         self.id=me["id"].as_i64().context("getMe.id missing")?;
         tracing::info!(bot_id=self.id,"polling initialized");
-        // Polling cannot run alongside a webhook without deleting it. We only delete
-        // it at startup; drop_pending_updates=false preserves pending events.
-        self.tg.call("deleteWebhook",json!({"drop_pending_updates":false})).await?;
+        // Do not destroy an existing webhook just because this binary started.
+        // Switching delivery modes is an explicit administrator operation.
+        let webhook = self.tg.call("getWebhookInfo", json!({})).await?;
+        if webhook["url"].as_str().is_some_and(|url| !url.is_empty()) {
+            anyhow::bail!("Telegram webhook is configured; refuse to start long polling");
+        }
         let mut failures: HashMap<i64,u8>=HashMap::new();
         let mut poll_errors=0u32;
         loop {
@@ -92,7 +123,21 @@ impl Bot {
     async fn challenge(&self, chat: i64, user: &User, flow: &str, delivery: i64) -> Result<()> {
         if user.is_bot || user.id==self.id { return Ok(()); }
         let settings=self.store.settings(chat)?;
-        if !settings.enabled || self.admin(chat,user.id).await? {return Ok(());}
+        if !settings.enabled {return Ok(());}
+        let member=self.tg.call("getChatMember",json!({
+            "chat_id":chat,"user_id":user.id
+        })).await?;
+        match member["status"].as_str() {
+            Some("administrator" | "creator")=>return Ok(()),
+            // Someone already under an individual sanction must never gain
+            // broader rights by solving a new-member challenge.
+            Some("restricted") if flow=="member"=>{
+                self.store.audit(chat,user.id,"manual","existing restrictions")?;
+                return Ok(());
+            }
+            Some("left" | "kicked") if flow=="member"=>return Ok(()),
+            _=>{}
+        }
         if let Some(previous)=self.store.get(chat,user.id)? {
             if skip_existing(&previous,flow,now()) {
                 return Ok(());
@@ -230,15 +275,19 @@ impl Bot {
         // The intended action is stored as "acting" before calling Telegram.
         // On a crash/uncertain response we do not blindly reissue the action.
         let result=match (c.flow.as_str(),action) {
-            ("member","pass")=>self.tg.call("restrictChatMember",json!({
-                "chat_id":c.chat_id,"user_id":c.user_id,
-                "permissions":{"can_send_messages":true,"can_send_audios":true,
-                  "can_send_documents":true,"can_send_photos":true,"can_send_videos":true,
-                  "can_send_video_notes":true,"can_send_voice_notes":true,
-                  "can_send_polls":true,"can_send_other_messages":true,
-                  "can_add_web_page_previews":true},
-                "use_independent_chat_permissions":true
-            })).await,
+            ("member","pass")=>{
+                match self.tg.call("getChat",json!({"chat_id":c.chat_id})).await {
+                    Ok(chat)=>match default_chat_permissions(&chat) {
+                        Ok(permissions)=>self.tg.call("restrictChatMember",json!({
+                            "chat_id":c.chat_id,"user_id":c.user_id,
+                            "permissions":permissions,
+                            "use_independent_chat_permissions":true
+                        })).await,
+                        Err(err)=>Err(err)
+                    },
+                    Err(err)=>Err(err)
+                }
+            },
             ("member","kick")=>self.tg.call("banChatMember",json!({
                 "chat_id":c.chat_id,"user_id":c.user_id,"until_date":now()+60
             })).await,
@@ -400,6 +449,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restores_only_existing_group_permissions() -> Result<()> {
+        let source=json!({"permissions":{
+            "can_send_messages":true,
+            "can_send_photos":false,
+            "can_invite_users":false
+        }});
+        let perms=default_chat_permissions(&source)?;
+        assert_eq!(perms["can_send_messages"], true);
+        assert_eq!(perms["can_send_photos"], false);
+        assert_eq!(perms["can_invite_users"], false);
+        assert!(perms.get("can_send_polls").is_none());
+        assert!(default_chat_permissions(&json!({})).is_err());
+        assert!(default_chat_permissions(&json!({"permissions":{"can_send_messages":"true"}})).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_polling_if_webhook_exists() -> Result<()> {
+        use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
+        let server=MockServer::start().await;
+        Mock::given(method("POST")).and(path("/botTEST/getMe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"id":123}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/getWebhookInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"url":"https://example.org/hook"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/deleteWebhook"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/getUpdates"))
+            .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let bot=Bot::new(Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/",server.uri())));
+        let error=bot.run().await.expect_err("polling must refuse configured webhook");
+        assert!(error.to_string().contains("webhook"));
+        server.verify().await;
+        Ok(())
+    }
+
+    #[test]
     fn request_and_member_statuses() {
         let c=Challenge{chat_id:-1,user_id:3,nonce:"abc".into(),flow:"request".into(),
             status:"pending".into(),delivery_chat_id:3,answer:10,options:vec![10],
@@ -437,6 +527,13 @@ mod tests {
         Mock::given(method("POST")).and(path("/botTEST/getChatMember"))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 json!({"ok":true,"result":{"status":"member"}})
+            )).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/botTEST/getChat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok":true,"result":{"permissions":{
+                    "can_send_messages":true,"can_send_photos":false,
+                    "can_send_polls":true,"can_invite_users":false
+                }}})
             )).expect(1).mount(&server).await;
         Mock::given(method("POST")).and(path("/botTEST/restrictChatMember"))
             .respond_with(success.clone()).expect(2).mount(&server).await;
