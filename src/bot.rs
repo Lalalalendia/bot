@@ -13,7 +13,10 @@ fn stale_event(event_at: i64, now_at: i64) -> bool {
 }
 
 fn skip_existing(previous: &Challenge, new_flow: &str, now_at: i64) -> bool {
-    if matches!(previous.status.as_str(), "pending" | "acting" | "manual" | "awaiting_message") {
+    if matches!(
+        previous.status.as_str(),
+        "pending" | "acting" | "manual" | "awaiting_message"
+    ) {
         return true;
     }
     // Telegram emits chat_member when a request is approved; never impose a
@@ -72,12 +75,22 @@ fn default_chat_permissions(chat: &Value) -> Result<Value> {
 fn no_send_permissions() -> Value {
     let mut permissions = serde_json::Map::new();
     for name in [
-        "can_send_messages", "can_send_audios", "can_send_documents",
-        "can_send_photos", "can_send_videos", "can_send_video_notes",
-        "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
-        "can_add_web_page_previews", "can_react_to_messages", "can_edit_tag",
-        "can_change_info", "can_invite_users",
-        "can_pin_messages", "can_manage_topics",
+        "can_send_messages",
+        "can_send_audios",
+        "can_send_documents",
+        "can_send_photos",
+        "can_send_videos",
+        "can_send_video_notes",
+        "can_send_voice_notes",
+        "can_send_polls",
+        "can_send_other_messages",
+        "can_add_web_page_previews",
+        "can_react_to_messages",
+        "can_edit_tag",
+        "can_change_info",
+        "can_invite_users",
+        "can_pin_messages",
+        "can_manage_topics",
     ] {
         permissions.insert(name.to_string(), Value::Bool(false));
     }
@@ -382,7 +395,8 @@ impl Bot {
                 )
                 .await;
             if let Err(e) = result {
-                self.store.audit(chat, user.id, "restrict_failed", &e.to_string())?;
+                self.store
+                    .audit(chat, user.id, "restrict_failed", &e.to_string())?;
                 // If Telegram refuses to restrict, attempt removal instead of
                 // silently leaving the newcomer able to send messages.
                 if self.store.claim(&c, "kick")? {
@@ -524,7 +538,8 @@ impl Bot {
                             .store
                             .get(chat, user)?
                             .context("challenge missing after acceptance")?;
-                        reply = if matches!(current.status.as_str(), "passed" | "awaiting_message") {
+                        reply = if matches!(current.status.as_str(), "passed" | "awaiting_message")
+                        {
                             "Проверка пройдена. Напишите сообщение в группе за 10 минут."
                         } else {
                             "Ответ правильный; требуется проверка администратора"
@@ -717,7 +732,8 @@ impl Bot {
             return Ok(());
         }
         if !edited && !sender.is_bot && !text.trim().is_empty() && !text.starts_with('/') {
-            self.store.record_first_message(m.chat.id, sender.id, m.message_id, m.date)?;
+            self.store
+                .record_first_message(m.chat.id, sender.id, m.message_id, m.date)?;
         }
         if !edited && text.starts_with('/') {
             let words: Vec<&str> = text.split_whitespace().collect();
@@ -939,22 +955,29 @@ impl Bot {
     }
 
     async fn expire_first_message(&self, c: &Challenge) -> Result<()> {
-        let member = match self.tg.call(
-            "getChatMember",
-            json!({"chat_id":c.chat_id,"user_id":c.user_id}),
-        ).await {
+        let member = match self
+            .tg
+            .call(
+                "getChatMember",
+                json!({"chat_id":c.chat_id,"user_id":c.user_id}),
+            )
+            .await
+        {
             Ok(value) => value,
             Err(error) => {
-                self.store.manual(c, "first message membership check failed")?;
+                self.store
+                    .manual(c, "first message membership check failed")?;
                 tracing::warn!(error=%error, "first-message timeout requires manual review");
                 return Ok(());
             }
         };
         let status = member["status"].as_str();
         if matches!(status, Some("administrator" | "creator")) {
-            self.store.close_first_message_window(c, "passed", "promoted to administrator")?;
+            self.store
+                .close_first_message_window(c, "passed", "promoted to administrator")?;
         } else if matches!(status, Some("left" | "kicked")) {
-            self.store.close_first_message_window(c, "failed", "already left group")?;
+            self.store
+                .close_first_message_window(c, "failed", "already left group")?;
         } else if status == Some("member")
             || (status == Some("restricted")
                 && member["is_member"] == true
@@ -966,7 +989,8 @@ impl Bot {
         } else {
             // A user still unable to send messages must not be kicked for
             // failing the post-CAPTCHA write requirement.
-            self.store.manual(c, "not confirmed as writable group member")?;
+            self.store
+                .manual(c, "not confirmed as writable group member")?;
         }
         Ok(())
     }
@@ -1010,7 +1034,6 @@ mod tests {
             assert_eq!(permissions[field], false, "{field} must be disabled");
         }
     }
-
 
     #[tokio::test]
     async fn one_wrong_answer_kicks_and_replay_does_not_kick_again() -> Result<()> {
@@ -1061,9 +1084,15 @@ mod tests {
             data: Some(format!("q:{}:{}:{}:9", c.chat_id, c.user_id, c.nonce)),
         };
         bot.callback(callback.clone()).await?;
-        assert_eq!(bot.store.get(c.chat_id, c.user_id)?.unwrap().status, "failed");
+        assert_eq!(
+            bot.store.get(c.chat_id, c.user_id)?.unwrap().status,
+            "failed"
+        );
         bot.callback(callback).await?;
-        assert_eq!(bot.store.get(c.chat_id, c.user_id)?.unwrap().status, "failed");
+        assert_eq!(
+            bot.store.get(c.chat_id, c.user_id)?.unwrap().status,
+            "failed"
+        );
         server.verify().await;
         Ok(())
     }
@@ -1090,10 +1119,7 @@ mod tests {
         store.create(&c)?;
         assert!(store.claim(&c, "pass")?);
         store.start_first_message_window(&c)?;
-        let bot = Bot::new(
-            store,
-            Telegram::mock("http://127.0.0.1:1/botTEST/".into()),
-        );
+        let bot = Bot::new(store, Telegram::mock("http://127.0.0.1:1/botTEST/".into()));
         let msg = Message {
             message_id: 80,
             chat: Chat { id: c.chat_id },
@@ -1110,7 +1136,10 @@ mod tests {
             caption_entities: Vec::new(),
         };
         bot.message(msg).await?;
-        assert_eq!(bot.store.get(c.chat_id, c.user_id)?.unwrap().status, "passed");
+        assert_eq!(
+            bot.store.get(c.chat_id, c.user_id)?.unwrap().status,
+            "passed"
+        );
         Ok(())
     }
 
@@ -1158,7 +1187,10 @@ mod tests {
         let bot = Bot::new(store, Telegram::mock(format!("{}/botTEST/", server.uri())));
         bot.sweep().await?;
         bot.sweep().await?;
-        assert_eq!(bot.store.get(c.chat_id, c.user_id)?.unwrap().status, "failed");
+        assert_eq!(
+            bot.store.get(c.chat_id, c.user_id)?.unwrap().status,
+            "failed"
+        );
         server.verify().await;
         Ok(())
     }

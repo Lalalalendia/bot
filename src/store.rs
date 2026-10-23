@@ -314,10 +314,24 @@ impl Store {
             "UPDATE challenges SET status='awaiting_message',action=NULL,
              updated_at=?1,expires_at=?2 WHERE chat_id=?3 AND user_id=?4
              AND nonce=?5 AND status='acting'",
-            params![admitted_at, admitted_at + 600, c.chat_id, c.user_id, c.nonce],
+            params![
+                admitted_at,
+                admitted_at + 600,
+                c.chat_id,
+                c.user_id,
+                c.nonce
+            ],
         )?;
-        anyhow::ensure!(updated == 1, "admission was not awaiting Telegram confirmation");
-        self.audit(c.chat_id, c.user_id, "awaiting_message", "first message within 600 seconds")?;
+        anyhow::ensure!(
+            updated == 1,
+            "admission was not awaiting Telegram confirmation"
+        );
+        self.audit(
+            c.chat_id,
+            c.user_id,
+            "awaiting_message",
+            "first message within 600 seconds",
+        )?;
         Ok(())
     }
 
@@ -340,7 +354,12 @@ impl Store {
             params![now(), chat, user, sent_at],
         )?;
         if updated == 1 {
-            self.audit(chat, user, "first_message", &format!("message_id={message_id}"))?;
+            self.audit(
+                chat,
+                user,
+                "first_message",
+                &format!("message_id={message_id}"),
+            )?;
         }
         Ok(updated == 1)
     }
@@ -363,7 +382,10 @@ impl Store {
         status: &str,
         reason: &str,
     ) -> Result<bool> {
-        anyhow::ensure!(matches!(status, "passed" | "failed"), "invalid first-message result");
+        anyhow::ensure!(
+            matches!(status, "passed" | "failed"),
+            "invalid first-message result"
+        );
         let updated = self.conn.execute(
             "UPDATE challenges SET status=?1,updated_at=?2
              WHERE chat_id=?3 AND user_id=?4 AND nonce=?5 AND status='awaiting_message'",
@@ -495,7 +517,6 @@ pub struct Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn one_attempt_and_message_window() -> Result<()> {
