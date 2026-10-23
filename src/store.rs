@@ -68,7 +68,7 @@ impl Store {
              CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS settings(
                chat_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
-               timeout_s INTEGER NOT NULL DEFAULT 90, attempts INTEGER NOT NULL DEFAULT 2,
+               timeout_s INTEGER NOT NULL DEFAULT 120, attempts INTEGER NOT NULL DEFAULT 1,
                links INTEGER NOT NULL DEFAULT 0, lockdown INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS challenges(
@@ -91,6 +91,8 @@ impl Store {
                callback_id TEXT PRIMARY KEY, at INTEGER NOT NULL
              );",
         )?;
+        // Upgrade existing groups to the single-attempt policy.
+        conn.execute("UPDATE settings SET attempts=1 WHERE attempts<>1", [])?;
         Ok(Self {
             conn,
             _instance_lock: instance_lock,
@@ -148,7 +150,6 @@ impl Store {
         let column = match key {
             "enabled" => "enabled",
             "timeout_s" => "timeout_s",
-            "attempts" => "attempts",
             "links" => "links",
             "lockdown" => "lockdown",
             _ => anyhow::bail!("invalid settings field"),
@@ -305,6 +306,75 @@ impl Store {
         Ok(())
     }
 
+    /// After Telegram confirms admission, give this member ten minutes
+    /// to write their first message. Reuse the existing SQLite challenge row.
+    pub fn start_first_message_window(&self, c: &Challenge) -> Result<()> {
+        let admitted_at = now();
+        let updated = self.conn.execute(
+            "UPDATE challenges SET status='awaiting_message',action=NULL,
+             updated_at=?1,expires_at=?2 WHERE chat_id=?3 AND user_id=?4
+             AND nonce=?5 AND status='acting'",
+            params![admitted_at, admitted_at + 600, c.chat_id, c.user_id, c.nonce],
+        )?;
+        anyhow::ensure!(updated == 1, "admission was not awaiting Telegram confirmation");
+        self.audit(c.chat_id, c.user_id, "awaiting_message", "first message within 600 seconds")?;
+        Ok(())
+    }
+
+    /// The Telegram message time must fall inside the admission window.
+    /// Edits, commands, empty messages and messages by bots are filtered by the caller.
+    pub fn record_first_message(
+        &self,
+        chat: i64,
+        user: i64,
+        message_id: i64,
+        sent_at: i64,
+    ) -> Result<bool> {
+        if message_id <= 0 || sent_at <= 0 {
+            return Ok(false);
+        }
+        let updated = self.conn.execute(
+            "UPDATE challenges SET status='passed',updated_at=?1
+             WHERE chat_id=?2 AND user_id=?3 AND status='awaiting_message'
+               AND updated_at<=?4 AND expires_at>=?4",
+            params![now(), chat, user, sent_at],
+        )?;
+        if updated == 1 {
+            self.audit(chat, user, "first_message", &format!("message_id={message_id}"))?;
+        }
+        Ok(updated == 1)
+    }
+
+    /// Atomically reserve the timeout action: a late message cannot undo it.
+    pub fn claim_first_message_timeout(&self, c: &Challenge) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE challenges SET status='acting',action='kick',updated_at=?1
+             WHERE chat_id=?2 AND user_id=?3 AND nonce=?4
+               AND status='awaiting_message' AND expires_at<=?1",
+            params![now(), c.chat_id, c.user_id, c.nonce],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Close the window without sanction if the member has left or become admin.
+    pub fn close_first_message_window(
+        &self,
+        c: &Challenge,
+        status: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(matches!(status, "passed" | "failed"), "invalid first-message result");
+        let updated = self.conn.execute(
+            "UPDATE challenges SET status=?1,updated_at=?2
+             WHERE chat_id=?3 AND user_id=?4 AND nonce=?5 AND status='awaiting_message'",
+            params![status, now(), c.chat_id, c.user_id, c.nonce],
+        )?;
+        if updated == 1 {
+            self.audit(c.chat_id, c.user_id, status, reason)?;
+        }
+        Ok(updated == 1)
+    }
+
     /// Telegram confirmed membership outside our own join-request approval.
     /// This can happen when a moderator approves the request in Telegram itself.
     /// Do not decline an already-admitted member when the old CAPTCHA times out.
@@ -401,7 +471,7 @@ impl Store {
 
     pub fn open_challenges(&self) -> Result<Vec<Challenge>> {
         let mut stmt = self.conn.prepare(
-            "SELECT chat_id,user_id FROM challenges WHERE status IN ('pending','acting','manual')",
+            "SELECT chat_id,user_id FROM challenges WHERE status IN ('pending','acting','manual','awaiting_message')",
         )?;
         let keys = stmt
             .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
@@ -425,13 +495,83 @@ pub struct Settings {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn one_attempt_and_message_window() -> Result<()> {
+        let s = Store::open(":memory:")?;
+        let c = Challenge {
+            chat_id: -100,
+            user_id: 31,
+            nonce: "first-message".into(),
+            flow: "member".into(),
+            status: "pending".into(),
+            delivery_chat_id: -100,
+            answer: 5,
+            options: vec![3, 5, 7],
+            attempts: 0,
+            expires_at: now() + 120,
+            message_id: Some(7),
+            action: None,
+            updated_at: now(),
+        };
+        s.create(&c)?;
+        assert!(s.claim(&c, "pass")?);
+        s.start_first_message_window(&c)?;
+        let waiting = s.get(-100, 31)?.context("challenge missing")?;
+        assert_eq!(waiting.status, "awaiting_message");
+        assert_eq!(waiting.expires_at - waiting.updated_at, 600);
+        assert!(!s.record_first_message(-100, 31, 12, waiting.updated_at - 1)?);
+        assert!(!s.record_first_message(-100, 31, 12, waiting.expires_at + 1)?);
+        assert!(s.record_first_message(-100, 31, 12, waiting.updated_at + 1)?);
+        assert!(!s.record_first_message(-100, 31, 12, waiting.updated_at + 2)?);
+        assert_eq!(s.get(-100, 31)?.unwrap().status, "passed");
+        assert!(!s.claim_first_message_timeout(&waiting)?);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_message_window_reserves_one_kick() -> Result<()> {
+        let s = Store::open(":memory:")?;
+        let c = Challenge {
+            chat_id: -300,
+            user_id: 88,
+            nonce: "expired-message".into(),
+            flow: "request".into(),
+            status: "pending".into(),
+            delivery_chat_id: 88,
+            answer: 12,
+            options: vec![11, 12],
+            attempts: 0,
+            expires_at: now() + 120,
+            message_id: Some(5),
+            action: None,
+            updated_at: now(),
+        };
+        s.create(&c)?;
+        assert!(s.claim(&c, "pass")?);
+        s.start_first_message_window(&c)?;
+        s.conn.execute(
+            "UPDATE challenges SET expires_at=?1 WHERE chat_id=?2 AND user_id=?3",
+            params![now() - 1, c.chat_id, c.user_id],
+        )?;
+        let waiting = s.get(-300, 88)?.context("challenge missing")?;
+        assert!(s.claim_first_message_timeout(&waiting)?);
+        assert!(!s.claim_first_message_timeout(&waiting)?);
+        assert!(!s.record_first_message(-300, 88, 10, now() - 1)?);
+        s.finish(&waiting, "failed")?;
+        assert_eq!(s.get(-300, 88)?.unwrap().status, "failed");
+        Ok(())
+    }
+
     #[test]
     fn durable_offsets_and_settings() -> Result<()> {
         let s = Store::open(":memory:")?;
         s.offset_save(9)?;
         s.offset_save(3)?;
         assert_eq!(s.offset()?, 9);
-        assert_eq!(s.settings(-5)?.timeout, 90);
+        assert_eq!(s.settings(-5)?.timeout, 120);
+        assert_eq!(s.settings(-5)?.max_attempts, 1);
+        assert!(s.setting(-5, "attempts", 3).is_err());
         assert!(s.setting(-5, "timeout_s", 120).is_ok());
         assert_eq!(s.settings(-5)?.timeout, 120);
         assert!(s.setting(-5, "foo", 120).is_err());
