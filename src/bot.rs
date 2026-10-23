@@ -1002,6 +1002,157 @@ mod tests {
 
 
     #[tokio::test]
+    async fn one_wrong_answer_kicks_and_replay_does_not_kick_again() -> Result<()> {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        let success = ResponseTemplate::new(200).set_body_json(json!({"ok":true,"result":true}));
+        Mock::given(method("POST"))
+            .and(path("/botTEST/banChatMember"))
+            .respond_with(success.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/answerCallbackQuery"))
+            .respond_with(success)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let bot = Bot::new(
+            Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/", server.uri())),
+        );
+        let c = Challenge {
+            chat_id: -401,
+            user_id: 43,
+            nonce: "one-answer".into(),
+            flow: "member".into(),
+            status: "pending".into(),
+            delivery_chat_id: -401,
+            answer: 6,
+            options: vec![6, 9],
+            attempts: 0,
+            expires_at: now() + 120,
+            message_id: None,
+            action: None,
+            updated_at: now(),
+        };
+        bot.store.create(&c)?;
+        let callback = Callback {
+            id: "one-click".into(),
+            user: User {
+                id: c.user_id,
+                is_bot: false,
+            },
+            data: Some(format!("q:{}:{}:{}:9", c.chat_id, c.user_id, c.nonce)),
+        };
+        bot.callback(callback.clone()).await?;
+        assert_eq!(bot.store.get(c.chat_id, c.user_id)?.unwrap().status, "failed");
+        bot.callback(callback).await?;
+        assert_eq!(bot.store.get(c.chat_id, c.user_id)?.unwrap().status, "failed");
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_real_message_completes_admission() -> Result<()> {
+        use crate::model::Chat;
+        let store = Store::open(":memory:")?;
+        let c = Challenge {
+            chat_id: -701,
+            user_id: 72,
+            nonce: "write-once".into(),
+            flow: "member".into(),
+            status: "pending".into(),
+            delivery_chat_id: -701,
+            answer: 4,
+            options: vec![4, 8],
+            attempts: 0,
+            expires_at: now() + 120,
+            message_id: None,
+            action: None,
+            updated_at: now(),
+        };
+        store.create(&c)?;
+        assert!(store.claim(&c, "pass")?);
+        store.start_first_message_window(&c)?;
+        let bot = Bot::new(
+            store,
+            Telegram::mock("http://127.0.0.1:1/botTEST/".into()),
+        );
+        let msg = Message {
+            message_id: 80,
+            chat: Chat { id: c.chat_id },
+            date: now(),
+            sender: Some(User {
+                id: c.user_id,
+                is_bot: false,
+            }),
+            text: Some("Привет всем!".into()),
+            caption: None,
+            edit_date: None,
+            new_chat_members: Vec::new(),
+            entities: Vec::new(),
+            caption_entities: Vec::new(),
+        };
+        bot.message(msg).await?;
+        assert_eq!(bot.store.get(c.chat_id, c.user_id)?.unwrap().status, "passed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silent_user_after_request_approval_gets_one_kick() -> Result<()> {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getChatMember"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok":true,"result":{"status":"member"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/banChatMember"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok":true,"result":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = Store::open(":memory:")?;
+        let c = Challenge {
+            chat_id: -800,
+            user_id: 81,
+            nonce: "silent".into(),
+            flow: "request".into(),
+            status: "awaiting_message".into(),
+            delivery_chat_id: 81,
+            answer: 9,
+            options: vec![9],
+            attempts: 0,
+            expires_at: now() - 1,
+            message_id: None,
+            action: None,
+            updated_at: now() - 601,
+        };
+        store.create(&c)?;
+        let bot = Bot::new(store, Telegram::mock(format!("{}/botTEST/", server.uri())));
+        bot.sweep().await?;
+        bot.sweep().await?;
+        assert_eq!(bot.store.get(c.chat_id, c.user_id)?.unwrap().status, "failed");
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn external_join_approval_closes_pending_request_without_second_captcha() -> Result<()> {
         use crate::model::{Chat, Member};
         use wiremock::{
@@ -2081,7 +2232,7 @@ mod tests {
             data: Some(data),
         })
         .await?;
-        assert_eq!(bot.store.get(-100, 42)?.unwrap().status, "passed");
+        assert_eq!(bot.store.get(-100, 42)?.unwrap().status, "awaiting_message");
         Ok(())
     }
 
