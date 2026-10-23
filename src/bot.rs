@@ -13,7 +13,7 @@ fn stale_event(event_at: i64, now_at: i64) -> bool {
 }
 
 fn skip_existing(previous: &Challenge, new_flow: &str, now_at: i64) -> bool {
-    if matches!(previous.status.as_str(), "pending" | "acting" | "manual") {
+    if matches!(previous.status.as_str(), "pending" | "acting" | "manual" | "awaiting_message") {
         return true;
     }
     // Telegram emits chat_member when a request is approved; never impose a
@@ -516,7 +516,7 @@ impl Bot {
                             .store
                             .get(chat, user)?
                             .context("challenge missing after acceptance")?;
-                        reply = if current.status == "passed" {
+                        reply = if matches!(current.status.as_str(), "passed" | "awaiting_message") {
                             "Проверка пройдена. Напишите сообщение в группе за 10 минут."
                         } else {
                             "Ответ правильный; требуется проверка администратора"
@@ -584,7 +584,7 @@ impl Bot {
                     Err(err) => Err(err),
                 }
             }
-            ("member", "kick") => {
+            ("member" | "request", "kick") => {
                 self.tg
                     .call(
                         "banChatMember",
