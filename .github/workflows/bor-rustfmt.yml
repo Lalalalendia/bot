@@ -1,0 +1,36 @@
+name: BOR rustfmt (temporary)
+
+on:
+  pull_request:
+    branches: [feat/rust-shield24-foundation]
+    paths:
+      - "src/**"
+      - ".github/workflows/bor-rustfmt.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.event.pull_request.number == 2 && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply rustfmt to tracked Rust files only
+        shell: bash
+        run: |
+          cargo fmt --all
+          git add src/bot.rs src/store.rs
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "style: apply rustfmt to BOR v0.1"
+            git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          fi
