@@ -49,6 +49,8 @@ fn default_chat_permissions(chat: &Value) -> Result<Value> {
         "can_send_polls",
         "can_send_other_messages",
         "can_add_web_page_previews",
+        "can_react_to_messages",
+        "can_edit_tag",
         "can_change_info",
         "can_invite_users",
         "can_pin_messages",
@@ -73,7 +75,8 @@ fn no_send_permissions() -> Value {
         "can_send_messages", "can_send_audios", "can_send_documents",
         "can_send_photos", "can_send_videos", "can_send_video_notes",
         "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
-        "can_add_web_page_previews", "can_change_info", "can_invite_users",
+        "can_add_web_page_previews", "can_react_to_messages", "can_edit_tag",
+        "can_change_info", "can_invite_users",
         "can_pin_messages", "can_manage_topics",
     ] {
         permissions.insert(name.to_string(), Value::Bool(false));
@@ -952,11 +955,17 @@ impl Bot {
             self.store.close_first_message_window(c, "passed", "promoted to administrator")?;
         } else if matches!(status, Some("left" | "kicked")) {
             self.store.close_first_message_window(c, "failed", "already left group")?;
-        } else if status == Some("member") {
+        } else if status == Some("member")
+            || (status == Some("restricted")
+                && member["is_member"] == true
+                && member["can_send_messages"] == true)
+        {
             if self.store.claim_first_message_timeout(c)? {
                 self.perform(c, "kick").await?;
             }
         } else {
+            // A user still unable to send messages must not be kicked for
+            // failing the post-CAPTCHA write requirement.
             self.store.manual(c, "not confirmed as writable group member")?;
         }
         Ok(())
@@ -994,6 +1003,8 @@ mod tests {
             "can_send_voice_notes",
             "can_send_polls",
             "can_send_other_messages",
+            "can_react_to_messages",
+            "can_edit_tag",
             "can_invite_users",
         ] {
             assert_eq!(permissions[field], false, "{field} must be disabled");
