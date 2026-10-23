@@ -412,7 +412,8 @@ impl Store {
     pub fn manual(&self, c: &Challenge, reason: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE challenges SET status='manual',updated_at=?1
-            WHERE chat_id=?2 AND user_id=?3 AND nonce=?4 AND status IN ('pending','acting')",
+            WHERE chat_id=?2 AND user_id=?3 AND nonce=?4
+              AND status IN ('pending','acting','awaiting_message')",
             params![now(), c.chat_id, c.user_id, c.nonce],
         )?;
         self.audit(c.chat_id, c.user_id, "manual", reason)?;
