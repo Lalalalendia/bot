@@ -24,7 +24,17 @@ impl Telegram {
         let client = Client::builder().timeout(Duration::from_secs(40)).build()?;
         Ok(Self {
             client,
-            endpoint: format!("https://api.telegram.org/bot{token}/"),
+            endpoint: {
+                #[cfg(feature = "resource-bench")]
+                {
+                    std::env::var("BOR_BENCH_ENDPOINT")
+                        .unwrap_or_else(|_| format!("https://api.telegram.org/bot{token}/"))
+                }
+                #[cfg(not(feature = "resource-bench"))]
+                {
+                    format!("https://api.telegram.org/bot{token}/")
+                }
+            },
         })
     }
 
