@@ -67,6 +67,20 @@ fn default_chat_permissions(chat: &Value) -> Result<Value> {
     Ok(Value::Object(permissions))
 }
 
+fn no_send_permissions() -> Value {
+    let mut permissions = serde_json::Map::new();
+    for name in [
+        "can_send_messages", "can_send_audios", "can_send_documents",
+        "can_send_photos", "can_send_videos", "can_send_video_notes",
+        "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+        "can_add_web_page_previews", "can_change_info", "can_invite_users",
+        "can_pin_messages", "can_manage_topics",
+    ] {
+        permissions.insert(name.to_string(), Value::Bool(false));
+    }
+    Value::Object(permissions)
+}
+
 pub struct Bot {
     store: Store,
     tg: Telegram,
@@ -102,9 +116,6 @@ impl Bot {
         let mut failures: HashMap<i64, u8> = HashMap::new();
         let mut poll_errors = 0u32;
         loop {
-            if let Err(e) = self.sweep().await {
-                tracing::error!(error=%e,"maintenance");
-            }
             let offset = self.store.offset()?;
             match self.tg.call("getUpdates",json!({
                 "offset":offset,"limit":50,"timeout":25,
@@ -146,6 +157,9 @@ impl Bot {
                     tracing::warn!(error=%e,"poll error");
                     tokio::time::sleep(Duration::from_secs(2u64.pow(poll_errors.min(5)))).await;
                 }
+            }
+            if let Err(e) = self.sweep().await {
+                tracing::error!(error=%e,"maintenance");
             }
         }
     }
@@ -359,7 +373,7 @@ impl Bot {
                     "restrictChatMember",
                     json!({
                         "chat_id":chat,"user_id":user.id,
-                        "permissions":{"can_send_messages":false},
+                        "permissions":no_send_permissions(),
                         "use_independent_chat_permissions":true
                     }),
                 )
@@ -503,13 +517,12 @@ impl Bot {
                             .get(chat, user)?
                             .context("challenge missing after acceptance")?;
                         reply = if current.status == "passed" {
-                            "Проверка пройдена"
+                            "Проверка пройдена. Напишите сообщение в группе за 10 минут."
                         } else {
                             "Ответ правильный; требуется проверка администратора"
                         };
                     } else {
-                        let limit = self.store.settings(chat)?.max_attempts;
-                        let (left, reject, fresh) = self.store.wrong_once(&state, limit, &c.id)?;
+                        let (left, reject, fresh) = self.store.wrong_once(&state, 1, &c.id)?;
                         if fresh {
                             if reject {
                                 // The transaction already reserved the terminal
@@ -525,7 +538,7 @@ impl Bot {
                                 .await?;
                             }
                             reply = if left == 0 {
-                                "Попытки закончились"
+                                "Проверка не пройдена"
                             } else {
                                 "Неверный ответ"
                             };
@@ -576,7 +589,7 @@ impl Bot {
                     .call(
                         "banChatMember",
                         json!({
-                            "chat_id":c.chat_id,"user_id":c.user_id,"until_date":now()+60
+                            "chat_id":c.chat_id,"user_id":c.user_id,"until_date":now()+86400
                         }),
                     )
                     .await
@@ -605,8 +618,11 @@ impl Bot {
         };
         match result {
             Ok(_) => {
-                self.store
-                    .finish(c, if action == "pass" { "passed" } else { "failed" })?;
+                if action == "pass" {
+                    self.store.start_first_message_window(c)?;
+                } else {
+                    self.store.finish(c, "failed")?;
+                }
                 if let Some(message) = c.message_id {
                     if let Err(e) = self
                         .tg
@@ -692,6 +708,9 @@ impl Bot {
         if self.moderate_links(&m, sender).await? {
             return Ok(());
         }
+        if !edited && !sender.is_bot && !text.trim().is_empty() && !text.starts_with('/') {
+            self.store.record_first_message(m.chat.id, sender.id, m.message_id, m.date)?;
+        }
         if !edited && text.starts_with('/') {
             let words: Vec<&str> = text.split_whitespace().collect();
             let command = match words[0].split_once('@') {
@@ -709,7 +728,7 @@ impl Bot {
                 None => words[0],
             };
             if command == "/help" {
-                self.tg.send(m.chat.id,"/help /status /guard on|off /links on|off /lockdown on|off /timeout 30..300 /attempts 1..5 /pending /allow ID /deny ID /stats").await?;
+                self.tg.send(m.chat.id,"/help /status /guard on|off /links on|off /lockdown on|off /timeout 30..300 /pending /allow ID /deny ID /stats").await?;
                 return Ok(());
             }
             if !self.admin(m.chat.id, sender.id).await? {
@@ -821,11 +840,6 @@ impl Bot {
                     .ok()
                     .filter(|n| (30..=300).contains(n))
                     .map(|n| ("timeout_s", n)),
-                ("/attempts", Some(v)) => v
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|n| (1..=5).contains(n))
-                    .map(|n| ("attempts", n)),
                 _ => None,
             };
             if let Some((key, value)) = update {
@@ -916,11 +930,40 @@ impl Bot {
         Ok(())
     }
 
+    async fn expire_first_message(&self, c: &Challenge) -> Result<()> {
+        let member = match self.tg.call(
+            "getChatMember",
+            json!({"chat_id":c.chat_id,"user_id":c.user_id}),
+        ).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.store.manual(c, "first message membership check failed")?;
+                tracing::warn!(error=%error, "first-message timeout requires manual review");
+                return Ok(());
+            }
+        };
+        let status = member["status"].as_str();
+        if matches!(status, Some("administrator" | "creator")) {
+            self.store.close_first_message_window(c, "passed", "promoted to administrator")?;
+        } else if matches!(status, Some("left" | "kicked")) {
+            self.store.close_first_message_window(c, "failed", "already left group")?;
+        } else if status == Some("member") {
+            if self.store.claim_first_message_timeout(c)? {
+                self.perform(c, "kick").await?;
+            }
+        } else {
+            self.store.manual(c, "not confirmed as writable group member")?;
+        }
+        Ok(())
+    }
+
     async fn sweep(&self) -> Result<()> {
         for c in self.store.open_challenges()? {
             if c.status == "acting" {
                 self.store
                     .manual(&c, "uncertain previous API action, verify manually")?;
+            } else if c.status == "awaiting_message" && c.expires_at <= now() {
+                self.expire_first_message(&c).await?;
             } else if c.status == "pending" && c.expires_at <= now() {
                 self.expire(&c).await?;
             } else if c.status == "pending" && c.message_id.is_none() {
