@@ -379,9 +379,14 @@ impl Bot {
                 )
                 .await;
             if let Err(e) = result {
-                self.store.manual(&c, &format!("restrict failed: {e}"))?;
+                self.store.audit(chat, user.id, "restrict_failed", &e.to_string())?;
+                // If Telegram refuses to restrict, attempt removal instead of
+                // silently leaving the newcomer able to send messages.
+                if self.store.claim(&c, "kick")? {
+                    self.perform(&c, "kick").await?;
+                }
                 tracing::error!(chat,user=user.id,error=%e,
-                    "Cannot restrict new member; admin attention required");
+                    "Could not restrict member; fail-closed removal requested");
                 return Ok(());
             }
         }
@@ -978,6 +983,23 @@ impl Bot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_initial_restriction_denies_media() {
+        let permissions = no_send_permissions();
+        for field in [
+            "can_send_messages",
+            "can_send_photos",
+            "can_send_videos",
+            "can_send_audios",
+            "can_send_voice_notes",
+            "can_send_polls",
+            "can_send_other_messages",
+            "can_invite_users",
+        ] {
+            assert_eq!(permissions[field], false, "{field} must be disabled");
+        }
+    }
+
 
     #[tokio::test]
     async fn external_join_approval_closes_pending_request_without_second_captcha() -> Result<()> {
