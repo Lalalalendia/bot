@@ -9,14 +9,30 @@ fi
 sha=$1
 mode=${2:-manual}
 case "$mode" in
-  manual) ;;
+  manual)
+    test ! -e /etc/bor/pilot-mode || { echo 'error=use_explicit_pilot_mode' >&2; exit 3; }
+    before_phase=--before
+    after_phase=--after
+    ;;
   --unattended)
-    # Only an operator can create this root-owned release-authority marker.
-    # It proves an independent off-host encrypted backup/restore drill was approved.
+    test ! -e /etc/bor/pilot-mode || { echo 'error=pilot_cannot_autoactivate' >&2; exit 3; }
     test -f /etc/bor-unattended-approved || {
       echo 'error=offhost_restore_not_approved_for_unattended_rollout' >&2
       exit 3
     }
+    before_phase=--before
+    after_phase=--after
+    ;;
+  --pilot)
+    test -f /etc/bor/pilot-mode || { echo 'error=pilot_bootstrap_not_installed' >&2; exit 3; }
+    # Cgroup memory ceiling must actually be loaded before any Telegram polling.
+    memory_max=$(systemctl show --value --property=MemoryMax bor.service)
+    [[ "$memory_max" == 67108864 ]] || {
+      echo 'error=pilot_systemd_64MiB_memory_cap_missing' >&2
+      exit 3
+    }
+    before_phase=--pilot-before
+    after_phase=--pilot-after
     ;;
   *) echo 'error=invalid_activation_mode' >&2; exit 2 ;;
 esac
@@ -61,7 +77,7 @@ if [[ "$previous" == "$release" ]]; then
 fi
 # Read-only shared-host safety check before touching BOR or its SQLite.
 # The root-owned script is installed only by operator-reviewed bootstrap.
-shared_before=$(/usr/local/libexec/bor-shared-vps-preflight --before)
+shared_before=$(/usr/local/libexec/bor-shared-vps-preflight "$before_phase")
 printf '%s\n' "$shared_before"
 before_units=$(printf '%s\n' "$shared_before" | grep '^erida_unit=')
 test -n "$before_units"
@@ -78,7 +94,7 @@ systemctl is-active --quiet bor.service
 [[ "$(readlink -f -- "$root/current")" == "$release" ]]
 # Recheck both remaining resources and Erida's exact service states.
 # Any change triggers the existing BOR-only rollback trap.
-shared_after=$(/usr/local/libexec/bor-shared-vps-preflight --after)
+shared_after=$(/usr/local/libexec/bor-shared-vps-preflight "$after_phase")
 printf '%s\n' "$shared_after"
 after_units=$(printf '%s\n' "$shared_after" | grep '^erida_unit=')
 if [[ "$before_units" != "$after_units" ]]; then

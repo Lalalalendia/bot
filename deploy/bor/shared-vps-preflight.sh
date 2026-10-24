@@ -9,8 +9,10 @@ if [[ $# -gt 1 ]]; then
 fi
 phase=${1:---before}
 case "$phase" in
-  --before) min_mem_kib=786432 ;;  # 768 MiB (512 Erida + 128 BOR + 128 reserve)
-  --after) min_mem_kib=655360 ;;   # 640 MiB minimum remaining after BOR starts
+  --before) min_mem_kib=786432 ;;  # Strict production, unchanged
+  --after) min_mem_kib=655360 ;;
+  --pilot-before) min_mem_kib=262144 ;;  # Explicit 64-MiB-limited test bot only
+  --pilot-after) min_mem_kib=196608 ;;
   *) echo 'error=invalid_shared_vps_phase' >&2; exit 2 ;;
 esac
 
@@ -42,6 +44,23 @@ fi
 if (( release_free < 1536 || state_free < 1536 )); then
   echo 'error=shared_vps_disk_below_1536MiB' >&2
   exit 3
+fi
+
+# The pilot's lower admission threshold is permitted only with NO recent
+# memory pressure. Production keeps its independent 768/640 MiB thresholds.
+if [[ "$phase" == --pilot-* ]]; then
+  some_10=$(awk '$1 == "some" { for (i=2; i<=NF; i++) if ($i ~ /^avg10=/) { sub(/^avg10=/, "", $i); print $i } }' /proc/pressure/memory)
+  full_10=$(awk '$1 == "full" { for (i=2; i<=NF; i++) if ($i ~ /^avg10=/) { sub(/^avg10=/, "", $i); print $i } }' /proc/pressure/memory)
+  [[ "$some_10" =~ ^[0-9]+([.][0-9]+)?$ && "$full_10" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    echo 'error=memory_pressure_metrics_missing' >&2
+    exit 3
+  }
+  echo "pilot_memory_some_avg10=$some_10"
+  echo "pilot_memory_full_avg10=$full_10"
+  if awk -v some="$some_10" -v full="$full_10" 'BEGIN { exit !(some > 1.0 || full > 0.2) }'; then
+    echo 'error=pilot_memory_pressure_too_high' >&2
+    exit 3
+  fi
 fi
 
 # A public, token-free request only verifies HTTPS/TLS and outgoing routing.

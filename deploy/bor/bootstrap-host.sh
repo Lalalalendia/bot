@@ -2,6 +2,11 @@
 # ONE-TIME root bootstrap on a dedicated Ubuntu/Debian VPS. No service activation.
 set -euo pipefail
 umask 022
+case "${1:-}" in
+  "") profile=production ;;
+  --pilot) profile=pilot ;;
+  *) echo 'error=invalid_bootstrap_mode' >&2; exit 2 ;;
+esac
 if [[ "$(id -u)" -ne 0 ]]; then
   echo 'error=root_required' >&2
   exit 2
@@ -13,7 +18,17 @@ done
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 # No users, units, directories or sudo grants may change until the
 # shared Erida VPS is proven safe by a completely read-only probe.
-bash "$script_dir/shared-vps-preflight.sh" --before
+if [[ "$profile" == pilot ]]; then
+  # Existing production services cannot silently be converted to pilot mode.
+  if systemctl is-active --quiet bor.service || systemctl is-enabled --quiet bor.service; then
+    echo 'error=refuse_pilot_conversion_of_existing_bor_service' >&2
+    exit 3
+  fi
+  bash "$script_dir/shared-vps-preflight.sh" --pilot-before
+else
+  test ! -e /etc/bor/pilot-mode || { echo 'error=pilot_requires_explicit_promotion' >&2; exit 3; }
+  bash "$script_dir/shared-vps-preflight.sh" --before
+fi
 if [[ -L /opt/bor || -L /etc/bor || -L /var/lib/bor ]]; then
   echo 'error=unexpected_symlink_in_service_roots' >&2
   exit 3
@@ -52,8 +67,17 @@ chmod 0440 "$sudoers_tmp"
 visudo -cf "$sudoers_tmp"
 mv -T -- "$sudoers_tmp" /etc/sudoers.d/bor-deploy
 trap - EXIT
-systemctl daemon-reload
-systemctl enable bor.service
+if [[ "$profile" == pilot ]]; then
+  install -d -o root -g root -m 0755 /etc/systemd/system/bor.service.d
+  install -o root -g root -m 0644 "$script_dir/bor-pilot.conf" /etc/systemd/system/bor.service.d/10-pilot.conf
+  install -o root -g root -m 0644 /dev/null /etc/bor/pilot-mode
+  systemctl daemon-reload
+  echo 'bor_pilot_limit=64MiB'
+  echo 'bor_autostart=disabled'
+else
+  systemctl daemon-reload
+  systemctl enable bor.service
+fi
 echo 'bor_bootstrap=PASS'
 echo 'bor_service_started=no'
 echo 'next=install_deploy_public_key_then_configure_GitHub_Secrets'
