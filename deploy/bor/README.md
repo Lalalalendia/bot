@@ -73,17 +73,16 @@ secrets instead of the public pilot release.
 
 Run these commands only after confirming `sha` matches the downloaded
 artifact. The root bootstrap itself repeats the pilot resource gate.
-Provision the secret without printing it:
+Telegram credentials are never entered on the VPS in the GitHub-managed
+pilot. The already-installed native service uses systemd LoadCredential to
+read a root-owned file; GitHub Actions supplies the one-time credential
+over pinned SSH from the BOR_BOT_TOKEN repository Secret.
 
-    read -rs -p 'TEST BotFather token: ' BOR_TOKEN; echo
-    read -r -p 'Test supergroup ID (-100...): ' BOR_CHAT
-    printf '%s\n%s\n' "$BOR_TOKEN" "$BOR_CHAT" |
-      sudo /usr/local/sbin/bor-install-credentials
-    unset BOR_TOKEN BOR_CHAT
-
-The token is not stored in the repository. For later automated production
-rollouts use protected GitHub Environment secrets; the pilot is a one-time
-operator installation because the native deploy workflow is not yet in main.
+The operator configures the BOR repository's Actions Secrets for the bot
+token, VPS SSH identity and host-key fingerprint. Secrets are scoped to
+the BOR repository and cannot be read from the Erida repository automatically.
+See the dedicated feature-branch pilot provisioning workflow; do not put
+the token into Git, shell history, public releases, or the VPS command line.
 
 **Step D: Manual start after Telegram preflight:**
 
