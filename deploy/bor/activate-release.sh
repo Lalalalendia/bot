@@ -2,11 +2,24 @@
 # Activate only an already staged immutable release. Roll back on failure.
 set -Eeuo pipefail
 umask 022
-if [[ $# -ne 1 || ! "$1" =~ ^[0-9a-f]{40}$ ]]; then
+if [[ $# -lt 1 || $# -gt 2 || ! "$1" =~ ^[0-9a-f]{40}$ ]]; then
   echo 'error=invalid_release_sha' >&2
   exit 2
 fi
 sha=$1
+mode=${2:-manual}
+case "$mode" in
+  manual) ;;
+  --unattended)
+    # Only an operator can create this root-owned release-authority marker.
+    # It proves an independent off-host encrypted backup/restore drill was approved.
+    test -f /etc/bor-unattended-approved || {
+      echo 'error=offhost_restore_not_approved_for_unattended_rollout' >&2
+      exit 3
+    }
+    ;;
+  *) echo 'error=invalid_activation_mode' >&2; exit 2 ;;
+esac
 root=/opt/bor
 release="$root/releases/$sha"
 test -d "$release" && test ! -L "$release"
