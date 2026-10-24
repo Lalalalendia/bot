@@ -772,10 +772,9 @@ mod tests {
         let mut new_samples = Vec::with_capacity(repeats);
 
         fn old_settings(store: &Store, chat: i64) -> Result<Settings> {
-            store.conn.execute(
-                "INSERT OR IGNORE INTO settings(chat_id) VALUES(?1)",
-                [chat],
-            )?;
+            store
+                .conn
+                .execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?1)", [chat])?;
             store.conn
                 .query_row(
                     "SELECT enabled,timeout_s,attempts,links,lockdown FROM settings WHERE chat_id=?1",
