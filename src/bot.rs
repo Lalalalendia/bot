@@ -2175,7 +2175,7 @@ mod tests {
             .filter(|r| r.url.path() == "/botTEST/getUpdates")
             .map(|r| -> Result<i64> {
                 let body: Value = serde_json::from_slice(&r.body)?;
-                Ok(body["offset"].as_i64().context("missing poll offset")?)
+                body["offset"].as_i64().context("missing poll offset")
             })
             .collect::<Result<Vec<_>>>()?;
         assert!(offsets.len() >= 2, "poller did not request updates twice");
