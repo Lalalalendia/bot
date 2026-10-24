@@ -36,7 +36,9 @@ permissions:
 
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('bor-native-pr-{0}', github.event.pull_request.number) || 'bor-native-production' }}
-  cancel-in-progress: false
+  # Superseded PR builds must not queue behind obsolete release packages.
+  # Main/production deployments are deliberately not cancellable.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify-and-package:
