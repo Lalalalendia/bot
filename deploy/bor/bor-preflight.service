@@ -1,0 +1,26 @@
+[Unit]
+Description=BOR read-only Telegram preflight for pending native release
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/opt/bor/current/rebuild-bot
+
+[Service]
+Type=oneshot
+User=bor
+Group=bor
+WorkingDirectory=/var/lib/bor
+EnvironmentFile=/etc/bor/preflight.env
+Environment=RUST_LOG=warn
+LoadCredential=bot_token:/etc/bor/bot_token
+ExecStart=/opt/bor/current/rebuild-bot --preflight
+TimeoutStartSec=65
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+

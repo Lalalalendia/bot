@@ -1,0 +1,23 @@
+[Unit]
+Description=BOR SQLite consistent local pre-upgrade backup
+ConditionPathExists=/var/lib/bor/rebuild.sqlite3
+
+[Service]
+Type=oneshot
+User=bor
+Group=bor
+WorkingDirectory=/var/lib/bor
+ExecStart=/usr/local/libexec/bor-backup
+TimeoutStartSec=90
+UMask=0077
+StateDirectory=bor
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/bor
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
