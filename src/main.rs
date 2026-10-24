@@ -39,14 +39,18 @@ mod credential_tests {
 
     #[test]
     fn missing_systemd_credential_never_falls_back_to_env() {
-        let missing = std::env::temp_dir().join(format!("bor-no-credential-{}", rand::random::<u64>()));
+        let missing =
+            std::env::temp_dir().join(format!("bor-no-credential-{}", rand::random::<u64>()));
         let err = load_bot_token(Some("local:test".into()), Some(missing)).unwrap_err();
-        assert!(err.to_string().contains("read systemd bot_token credential"));
+        assert!(err
+            .to_string()
+            .contains("read systemd bot_token credential"));
     }
 
     #[test]
     fn systemd_credential_takes_priority_and_trims_newline() -> Result<()> {
-        let directory = std::env::temp_dir().join(format!("bor-test-credential-{}", rand::random::<u64>()));
+        let directory =
+            std::env::temp_dir().join(format!("bor-test-credential-{}", rand::random::<u64>()));
         std::fs::create_dir(&directory)?;
         std::fs::write(directory.join("bot_token"), b"12345:EXAMPLE\n")?;
         let actual = load_bot_token(Some("must-not-be-used".into()), Some(directory.clone()))?;
