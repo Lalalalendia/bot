@@ -74,8 +74,11 @@ not benchmark results or proof of future resource sufficiency:
   the first installation. It never restarts Erida or Nginx.
 
 GitHub Actions repeats this read-only gate before any staging, stores a
-sanitized 7-day preflight report, then the root-installed BOR activation script
-repeats it immediately before switching and after startup. Staging is denied
+sanitized 7-day preflight report, and verifies SHA-256 of all root-installed
+BOR deployment scripts and systemd units against the current reviewed Git
+commit. An outdated root bootstrap blocks deployment rather than bypassing
+the new shared-VPS gates. The root-installed BOR activation script repeats
+the gate immediately before switching and after startup. Staging is denied
 if the shared gate cannot prove the host, capacity or Telegram connectivity.
 
 **Important:** Historical Erida preflight recorded only ~313 MiB available

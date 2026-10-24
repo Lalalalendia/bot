@@ -196,6 +196,12 @@ fi
         workflow = self.text(".github/workflows/bor-native-vps.yml")
         self.assertIn("bash -s -- --before", workflow)
         self.assertIn("bor-shared-vps-preflight.txt", workflow)
+        self.assertIn("bor_host_installer_pinned=PASS", workflow)
+        self.assertIn("error=bor_bootstrap_outdated", workflow)
+        for source in ("activate-release.sh", "shared-vps-preflight.sh",
+                       "stage-release.sh", "bor.service",
+                       "bor-preflight.service", "bor-backup.service"):
+            self.assertIn(f"deploy/bor/{source}|", workflow)
 
 if __name__ == "__main__":
     unittest.main()

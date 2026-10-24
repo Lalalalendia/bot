@@ -136,6 +136,30 @@ jobs:
             | tee "$RUNNER_TEMP/bor-shared-vps-preflight.txt"
           grep -Fx 'bor_shared_vps_preflight=PASS' "$RUNNER_TEMP/bor-shared-vps-preflight.txt"
           grep -Fx 'shared_vps_mutations=no' "$RUNNER_TEMP/bor-shared-vps-preflight.txt"
+      - name: Verify root-owned BOR scripts and units match this exact commit
+        run: |
+          set -euo pipefail
+          destination="$DEPLOY_USER@$DEPLOY_HOST"
+          while IFS='|' read -r source remote; do
+            expected=$(sha256sum "$source" | cut -d' ' -f1)
+            actual=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" \
+              "sha256sum '$remote'" | cut -d' ' -f1)
+            if [[ "$expected" != "$actual" ]]; then
+              echo "error=bor_bootstrap_outdated:$remote" >&2
+              exit 3
+            fi
+          done <<'BOR_HOST_PATHS'
+          deploy/bor/activate-release.sh|/usr/local/libexec/bor-activate-release
+          deploy/bor/shared-vps-preflight.sh|/usr/local/libexec/bor-shared-vps-preflight
+          deploy/bor/host-preflight.sh|/usr/local/libexec/bor-host-preflight
+          deploy/bor/stage-release.sh|/usr/local/libexec/bor-stage-release
+          deploy/bor/bor-backup.sh|/usr/local/libexec/bor-backup
+          deploy/bor/bor-install-credentials.sh|/usr/local/sbin/bor-install-credentials
+          deploy/bor/bor.service|/etc/systemd/system/bor.service
+          deploy/bor/bor-preflight.service|/etc/systemd/system/bor-preflight.service
+          deploy/bor/bor-backup.service|/etc/systemd/system/bor-backup.service
+          BOR_HOST_PATHS
+          echo 'bor_host_installer_pinned=PASS'
       - name: Read-only VPS preflight, then stage verified packet
         run: |
           set -euo pipefail
