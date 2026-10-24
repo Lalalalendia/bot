@@ -2470,13 +2470,7 @@ mod tests {
         assert_eq!(bot.store.list_open(-100, 10)?.len(), 1);
         Ok(())
     }
-}
-
-#[cfg(test)]
-mod pilot_scope_tests {
-    use super::*;
-
-    #[test]
+#[test]
     fn pilot_scope_ignores_other_chats_and_private_messages() -> Result<()> {
         let test_group = -1001234567890_i64;
         for chat in [test_group, -1009876543210_i64, 42] {
@@ -2517,4 +2511,5 @@ mod pilot_scope_tests {
         assert_eq!(update_target_chat(&malformed), None);
         Ok(())
     }
+
 }
