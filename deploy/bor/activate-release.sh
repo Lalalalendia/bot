@@ -10,12 +10,12 @@ sha=$1
 mode=${2:-manual}
 case "$mode" in
   manual)
-    test ! -e /etc/bor/pilot-mode || { echo 'error=use_explicit_pilot_mode' >&2; exit 3; }
+    test ! -e /etc/bor-pilot-mode || { echo 'error=use_explicit_pilot_mode' >&2; exit 3; }
     before_phase=--before
     after_phase=--after
     ;;
   --unattended)
-    test ! -e /etc/bor/pilot-mode || { echo 'error=pilot_cannot_autoactivate' >&2; exit 3; }
+    test ! -e /etc/bor-pilot-mode || { echo 'error=pilot_cannot_autoactivate' >&2; exit 3; }
     test -f /etc/bor-unattended-approved || {
       echo 'error=offhost_restore_not_approved_for_unattended_rollout' >&2
       exit 3
@@ -24,7 +24,7 @@ case "$mode" in
     after_phase=--after
     ;;
   --pilot)
-    test -f /etc/bor/pilot-mode || { echo 'error=pilot_bootstrap_not_installed' >&2; exit 3; }
+    test -f /etc/bor-pilot-mode || { echo 'error=pilot_bootstrap_not_installed' >&2; exit 3; }
     # Cgroup memory ceiling must actually be loaded before any Telegram polling.
     memory_max=$(systemctl show --value --property=MemoryMax bor.service)
     [[ "$memory_max" == 67108864 ]] || {

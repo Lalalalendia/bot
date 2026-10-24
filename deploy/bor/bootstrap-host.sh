@@ -26,7 +26,8 @@ if [[ "$profile" == pilot ]]; then
   fi
   bash "$script_dir/shared-vps-preflight.sh" --pilot-before
 else
-  test ! -e /etc/bor/pilot-mode || { echo 'error=pilot_requires_explicit_promotion' >&2; exit 3; }
+  test ! -e /etc/bor-pilot-mode || { echo 'error=pilot_requires_explicit_promotion' >&2; exit 3; }
+  test ! -e /etc/bor/pilot-mode || { echo 'error=legacy_pilot_requires_explicit_promotion' >&2; exit 3; }
   bash "$script_dir/shared-vps-preflight.sh" --before
 fi
 if [[ -L /opt/bor || -L /etc/bor || -L /var/lib/bor ]]; then
@@ -70,7 +71,10 @@ trap - EXIT
 if [[ "$profile" == pilot ]]; then
   install -d -o root -g root -m 0755 /etc/systemd/system/bor.service.d
   install -o root -g root -m 0644 "$script_dir/bor-pilot.conf" /etc/systemd/system/bor.service.d/10-pilot.conf
-  install -o root -g root -m 0644 /dev/null /etc/bor/pilot-mode
+  # /etc/bor has mode 0700 for bot credentials and is deliberately not
+  # searchable by bor-deploy. Store the non-secret pilot marker separately.
+  test ! -L /etc/bor-pilot-mode || { echo 'error=pilot_marker_symlink' >&2; exit 3; }
+  install -o root -g root -m 0644 /dev/null /etc/bor-pilot-mode
   systemctl daemon-reload
   echo 'bor_pilot_limit=64MiB'
   echo 'bor_autostart=disabled'
