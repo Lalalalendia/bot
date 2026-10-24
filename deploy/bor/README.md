@@ -84,9 +84,11 @@ the BOR repository and cannot be read from the Erida repository automatically.
 See the dedicated feature-branch pilot provisioning workflow; do not put
 the token into Git, shell history, public releases, or the VPS command line.
 
-**Step D: Manual start after Telegram preflight:**
+**Step D: GitHub Actions provision and activate the staged pilot.**
 
-    sudo -u bor-deploy -H /usr/local/libexec/bor-activate-release "$sha" --pilot
+Run the GitHub Secrets delivery workflow described immediately below.
+It provisions the token without putting it in the VPS terminal, checks
+Telegram read-only and starts the already staged release.
     systemctl status bor.service --no-pager
     systemctl show bor.service -p MemoryMax -p MemoryCurrent -p CPUQuotaPerSecUSec
     readlink -f /opt/bor/current
@@ -101,6 +103,62 @@ Do not enable `BOR_DEPLOY_ENABLED` or create
 Telegram tests before enabling any bot autostart. Keep 319 MiB available
 RAM and zero PSI in perspective: these were the prior user measurements,
 not a guarantee of current headroom.
+
+## GitHub Secrets -> already staged BOR pilot
+
+The first native BOR release `26e3513fb4269890f135479af41e7df048e380b9`
+has already been staged on the shared VPS. To complete installation without
+typing a token on the server, use the dedicated
+[`bor-pilot-provision.yml`](../../.github/workflows/bor-pilot-provision.yml)
+GitHub Actions workflow. It does NOT download a newer release, restart Erida,
+use Docker or change the strict production deployment workflow.
+
+**One-time operator step on the VPS:** fetch the latest checkout and
+re-bootstrap the existing pilot to install the root-owned, non-secret
+`/etc/bor-pilot-mode` marker. The earlier marker was inside `/etc/bor`,
+which is intentionally inaccessible to the unprivileged deploy user.
+
+    cd /root/bot
+    git pull --ff-only
+    bash deploy/bor/shared-vps-preflight.sh --pilot-before
+    bash deploy/bor/bootstrap-host.sh --pilot
+
+The last command repeats the same safety checks. It neither installs a token
+nor starts BOR, and must print `bor_bootstrap=PASS`.
+
+**One-time SSH access:** the GitHub runner uses a dedicated
+`bor-deploy` account, not root and not the Erida deploy account. Place the
+public key corresponding to your GitHub Actions SSH private key into
+`/home/bor-deploy/.ssh/authorized_keys` (owner `bor-deploy`,
+`~/.ssh` mode 0700, `authorized_keys` mode 0600; use OpenSSH
+`restrict` option). Pin the VPS's actual host public key rather than
+trusting an unauthenticated `ssh-keyscan` result.
+
+In **`Lalalalendia/bot` → Settings → Secrets and variables → Actions**:
+
+- Required *Secrets*: `BOR_BOT_TOKEN` (the test BotFather token),
+  `BOR_DEPLOY_HOST` (VPS public hostname/IP), `BOR_DEPLOY_SSH_KEY`
+  (private key matching `bor-deploy`'s authorized key),
+  `BOR_DEPLOY_KNOWN_HOSTS` (verified `<host> ssh-ed25519 <public-key>`).
+- Optional *Secret*: `BOR_TEST_CHAT_ID`. When absent, the GitHub runner
+  asks Telegram `getUpdates` and accepts **exactly one** supergroup,
+  not an arbitrary first match. Add the bot as admin to one isolated test
+  supergroup and post `/start` there. If ambiguous, set the explicit ID.
+- Repository *Variable*: `BOR_PILOT_PROVISION_ENABLED=true`. This is an
+  explicit gate for a **feature-branch push**, with the separate `bor-pilot`
+  GitHub Environment for any desired required-reviewer protection.
+
+On the next matching feature-branch push, GitHub validates the branch,
+re-checks VPS RAM/PSI, Telegram reachability, Erida status, the exact
+pre-staged SHA and the **64 MiB systemd cap**, then sends the token over
+pinned SSH standard input to the already installed one-time
+`bor-install-credentials` script. It performs a read-only Telegram
+preflight before activating BOR with `--pilot` and verifies service
+liveness. On first-run failure, the activation script stops BOR only.
+
+If credentials are already installed, provisioning fails closed instead
+of overwriting them. Set `BOR_PILOT_PROVISION_ENABLED=false` after
+successful installation. The production workflow remains main-only.
 
 ## Source and release layout
 
