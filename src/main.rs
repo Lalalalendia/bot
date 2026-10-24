@@ -65,7 +65,28 @@ async fn main() -> Result<()> {
     }
     let database =
         std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/rebuild.sqlite3".into());
+    // Pilot mode only processes events belonging to the approved test
+    // supergroup. Any other chat, including private messages, is ignored.
+    let pilot_chat = match std::env::var("BOR_PILOT_MODE").ok().as_deref() {
+        None => None,
+        Some("1") => {
+            let chat_id = std::env::var("TEST_CHAT_ID")
+                .context("TEST_CHAT_ID required when BOR_PILOT_MODE=1")?
+                .parse::<i64>()
+                .context("pilot TEST_CHAT_ID must be a numeric Telegram ID")?;
+            anyhow::ensure!(
+                chat_id.to_string().starts_with("-100"),
+                "pilot scope must be a Telegram supergroup ID"
+            );
+            Some(chat_id)
+        }
+        Some(_) => anyhow::bail!("BOR_PILOT_MODE must be 1 or unset"),
+    };
     let bot = Bot::new(Store::open(&database)?, tg);
+    let bot = match pilot_chat {
+        Some(chat) => bot.scoped_to(chat),
+        None => bot,
+    };
     bot.run().await
 }
 
