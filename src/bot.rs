@@ -2511,5 +2511,3 @@ mod tests {
         assert_eq!(update_target_chat(&malformed), None);
         Ok(())
     }
-
-}
