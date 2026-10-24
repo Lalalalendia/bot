@@ -794,7 +794,7 @@ mod tests {
         }
 
         for run in 0..repeats {
-            let mut bench_old = || -> Result<u128> {
+            let bench_old = || -> Result<u128> {
                 let start = Instant::now();
                 for _ in 0..iterations {
                     let x = old_settings(&store, chat)?;
@@ -803,7 +803,7 @@ mod tests {
                 }
                 Ok(start.elapsed().as_micros())
             };
-            let mut bench_new = || -> Result<u128> {
+            let bench_new = || -> Result<u128> {
                 let start = Instant::now();
                 for _ in 0..iterations {
                     let x = store.settings(chat)?;
