@@ -68,7 +68,7 @@ impl Store {
              CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS settings(
                chat_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
-               timeout_s INTEGER NOT NULL DEFAULT 90, attempts INTEGER NOT NULL DEFAULT 2,
+               timeout_s INTEGER NOT NULL DEFAULT 120, attempts INTEGER NOT NULL DEFAULT 1,
                links INTEGER NOT NULL DEFAULT 0, lockdown INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS challenges(
@@ -89,8 +89,14 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS processed_callbacks(
                callback_id TEXT PRIMARY KEY, at INTEGER NOT NULL
-             );",
+             );
+             CREATE INDEX IF NOT EXISTS idx_challenges_sweep_expiry
+                 ON challenges(status, expires_at);
+             CREATE INDEX IF NOT EXISTS idx_challenges_sweep_unsent
+                 ON challenges(status, message_id);",
         )?;
+        // Upgrade existing groups to the single-attempt policy.
+        conn.execute("UPDATE settings SET attempts=1 WHERE attempts<>1", [])?;
         Ok(Self {
             conn,
             _instance_lock: instance_lock,
@@ -148,7 +154,6 @@ impl Store {
         let column = match key {
             "enabled" => "enabled",
             "timeout_s" => "timeout_s",
-            "attempts" => "attempts",
             "links" => "links",
             "lockdown" => "lockdown",
             _ => anyhow::bail!("invalid settings field"),
@@ -305,6 +310,97 @@ impl Store {
         Ok(())
     }
 
+    /// After Telegram confirms admission, give this member ten minutes
+    /// to write their first message. Reuse the existing SQLite challenge row.
+    pub fn start_first_message_window(&self, c: &Challenge) -> Result<()> {
+        let admitted_at = now();
+        let updated = self.conn.execute(
+            "UPDATE challenges SET status='awaiting_message',action=NULL,
+             updated_at=?1,expires_at=?2 WHERE chat_id=?3 AND user_id=?4
+             AND nonce=?5 AND status='acting'",
+            params![
+                admitted_at,
+                admitted_at + 600,
+                c.chat_id,
+                c.user_id,
+                c.nonce
+            ],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "admission was not awaiting Telegram confirmation"
+        );
+        self.audit(
+            c.chat_id,
+            c.user_id,
+            "awaiting_message",
+            "first message within 600 seconds",
+        )?;
+        Ok(())
+    }
+
+    /// The Telegram message time must fall inside the admission window.
+    /// Edits, commands, empty messages and messages by bots are filtered by the caller.
+    pub fn record_first_message(
+        &self,
+        chat: i64,
+        user: i64,
+        message_id: i64,
+        sent_at: i64,
+    ) -> Result<bool> {
+        if message_id <= 0 || sent_at <= 0 {
+            return Ok(false);
+        }
+        let updated = self.conn.execute(
+            "UPDATE challenges SET status='passed',updated_at=?1
+             WHERE chat_id=?2 AND user_id=?3 AND status='awaiting_message'
+               AND updated_at<=?4 AND expires_at>=?4",
+            params![now(), chat, user, sent_at],
+        )?;
+        if updated == 1 {
+            self.audit(
+                chat,
+                user,
+                "first_message",
+                &format!("message_id={message_id}"),
+            )?;
+        }
+        Ok(updated == 1)
+    }
+
+    /// Atomically reserve the timeout action: a late message cannot undo it.
+    pub fn claim_first_message_timeout(&self, c: &Challenge) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE challenges SET status='acting',action='kick',updated_at=?1
+             WHERE chat_id=?2 AND user_id=?3 AND nonce=?4
+               AND status='awaiting_message' AND expires_at<=?1",
+            params![now(), c.chat_id, c.user_id, c.nonce],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Close the window without sanction if the member has left or become admin.
+    pub fn close_first_message_window(
+        &self,
+        c: &Challenge,
+        status: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            matches!(status, "passed" | "failed"),
+            "invalid first-message result"
+        );
+        let updated = self.conn.execute(
+            "UPDATE challenges SET status=?1,updated_at=?2
+             WHERE chat_id=?3 AND user_id=?4 AND nonce=?5 AND status='awaiting_message'",
+            params![status, now(), c.chat_id, c.user_id, c.nonce],
+        )?;
+        if updated == 1 {
+            self.audit(c.chat_id, c.user_id, status, reason)?;
+        }
+        Ok(updated == 1)
+    }
+
     /// Telegram confirmed membership outside our own join-request approval.
     /// This can happen when a moderator approves the request in Telegram itself.
     /// Do not decline an already-admitted member when the old CAPTCHA times out.
@@ -342,7 +438,8 @@ impl Store {
     pub fn manual(&self, c: &Challenge, reason: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE challenges SET status='manual',updated_at=?1
-            WHERE chat_id=?2 AND user_id=?3 AND nonce=?4 AND status IN ('pending','acting')",
+            WHERE chat_id=?2 AND user_id=?3 AND nonce=?4
+              AND status IN ('pending','acting','awaiting_message')",
             params![now(), c.chat_id, c.user_id, c.nonce],
         )?;
         self.audit(c.chat_id, c.user_id, "manual", reason)?;
@@ -399,12 +496,20 @@ impl Store {
         Ok(counts)
     }
 
-    pub fn open_challenges(&self) -> Result<Vec<Challenge>> {
+    /// Materialize only work the maintenance loop can actually act upon.
+    /// Future CAPTCHA/probation rows stay indexed in SQLite rather than being
+    /// decoded, allocated, and looked up after every getUpdates response.
+    /// Unconfirmed deliveries must still be surfaced immediately after restart.
+    pub fn sweep_candidates(&self, as_of: i64) -> Result<Vec<Challenge>> {
         let mut stmt = self.conn.prepare(
-            "SELECT chat_id,user_id FROM challenges WHERE status IN ('pending','acting','manual')",
+            "SELECT chat_id,user_id FROM challenges
+             WHERE status='acting'
+                OR (status='pending' AND message_id IS NULL)
+                OR (status='pending' AND expires_at<=?1)
+                OR (status='awaiting_message' AND expires_at<=?1)",
         )?;
         let keys = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .query_map([as_of], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         keys.into_iter()
             .map(|(chat, user)| self.get(chat, user)?.context("challenge disappeared"))
@@ -426,12 +531,266 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sweep_loads_only_actionable_rows_even_with_many_future_challenges() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        let current = now();
+        for user_id in 1..=1_000_i64 {
+            store.create(&Challenge {
+                chat_id: -10,
+                user_id,
+                nonce: format!("sweep-{user_id}"),
+                flow: "member".into(),
+                status: if user_id % 2 == 0 {
+                    "awaiting_message"
+                } else {
+                    "pending"
+                }
+                .into(),
+                delivery_chat_id: -10,
+                answer: 7,
+                options: vec![3, 5, 7],
+                attempts: 0,
+                expires_at: current + 600,
+                message_id: Some(user_id),
+                action: None,
+                updated_at: current,
+            })?;
+        }
+        assert_eq!(store.sweep_candidates(current)?.len(), 0);
+
+        // Unsent pending challenge is actionable, regardless of its deadline.
+        store
+            .conn
+            .execute("UPDATE challenges SET message_id=NULL WHERE user_id=1", [])?;
+        // Pending and probation whose timers expired must still be returned.
+        store.conn.execute(
+            "UPDATE challenges SET expires_at=?1 WHERE user_id IN (2,3)",
+            [current - 1],
+        )?;
+        // In-flight API action needs manual reconciliation, even if not expired.
+        store
+            .conn
+            .execute("UPDATE challenges SET status='acting' WHERE user_id=4", [])?;
+        // Manual-review entries are not auto-actionable.
+        store
+            .conn
+            .execute("UPDATE challenges SET status='manual' WHERE user_id=5", [])?;
+        let candidates = store.sweep_candidates(current)?;
+        let mut ids: Vec<i64> = candidates.iter().map(|c| c.user_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        // A future-dated cutoff cannot pick up new rows from the current instant.
+        assert_eq!(
+            store
+                .sweep_candidates(current - 1)?
+                .iter()
+                .map(|c| c.user_id)
+                .filter(|id| *id == 6)
+                .count(),
+            0
+        );
+        Ok(())
+    }
+
+    /// Perf experiment, never used as a timing gate on shared CI runners.
+    /// The control path is the old Store::open_challenges implementation.
+    #[test]
+    #[ignore = "run in dedicated performance CI"]
+    fn bench_due_sweep_against_legacy() -> Result<()> {
+        use std::time::Instant;
+
+        fn legacy_scan(store: &Store) -> Result<Vec<Challenge>> {
+            let mut stmt = store.conn.prepare(
+                "SELECT chat_id,user_id FROM challenges
+                 WHERE status IN ('pending','acting','manual','awaiting_message')",
+            )?;
+            let keys = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            keys.into_iter()
+                .map(|(chat, user)| store.get(chat, user)?.context("challenge disappeared"))
+                .collect()
+        }
+
+        fn is_due(c: &Challenge, at: i64) -> bool {
+            c.status == "acting"
+                || (c.status == "pending" && (c.message_id.is_none() || c.expires_at <= at))
+                || (c.status == "awaiting_message" && c.expires_at <= at)
+        }
+
+        fn run_case(rows: i64, repeats: usize) -> Result<()> {
+            let store = Store::open(":memory:")?;
+            let at = now();
+            for user_id in 1..=rows {
+                let status = if user_id % 211 == 0 {
+                    "manual"
+                } else if user_id % 101 == 0 {
+                    "acting"
+                } else if user_id % 2 == 0 {
+                    "awaiting_message"
+                } else {
+                    "pending"
+                };
+                store.create(&Challenge {
+                    chat_id: -123,
+                    user_id,
+                    nonce: format!("bench-{user_id}"),
+                    flow: "member".into(),
+                    status: status.into(),
+                    delivery_chat_id: -123,
+                    answer: 5,
+                    options: vec![2, 5, 7],
+                    attempts: 0,
+                    expires_at: if user_id % 103 == 0 { at - 1 } else { at + 600 },
+                    message_id: if user_id % 31 == 0 {
+                        None
+                    } else {
+                        Some(user_id)
+                    },
+                    action: None,
+                    updated_at: at,
+                })?;
+            }
+
+            let old = legacy_scan(&store)?;
+            let due = store.sweep_candidates(at)?;
+            let mut expected: Vec<i64> = old
+                .iter()
+                .filter(|c| is_due(c, at))
+                .map(|c| c.user_id)
+                .collect();
+            let mut actual: Vec<i64> = due.iter().map(|c| c.user_id).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "must preserve every sanction candidate");
+
+            let mut old_ns = Vec::with_capacity(repeats);
+            let mut new_ns = Vec::with_capacity(repeats);
+            for iteration in 0..repeats {
+                if iteration % 2 == 0 {
+                    let start = Instant::now();
+                    let result = legacy_scan(&store)?;
+                    std::hint::black_box(result.len());
+                    old_ns.push(start.elapsed().as_nanos());
+
+                    let start = Instant::now();
+                    let result = store.sweep_candidates(at)?;
+                    std::hint::black_box(result.len());
+                    new_ns.push(start.elapsed().as_nanos());
+                } else {
+                    let start = Instant::now();
+                    let result = store.sweep_candidates(at)?;
+                    std::hint::black_box(result.len());
+                    new_ns.push(start.elapsed().as_nanos());
+
+                    let start = Instant::now();
+                    let result = legacy_scan(&store)?;
+                    std::hint::black_box(result.len());
+                    old_ns.push(start.elapsed().as_nanos());
+                }
+            }
+
+            old_ns.sort_unstable();
+            new_ns.sort_unstable();
+            let p50 = repeats / 2;
+            let p95 = ((repeats * 95) / 100).min(repeats - 1);
+            println!(
+                "BOR_SWEEP_BENCH {}",
+                serde_json::json!({
+                    "rows_waiting": rows,
+                    "rows_materialized_legacy": old.len(),
+                    "rows_materialized_due": due.len(),
+                    "repeats": repeats,
+                    "legacy_p50_us": old_ns[p50] as f64 / 1000.0,
+                    "legacy_p95_us": old_ns[p95] as f64 / 1000.0,
+                    "new_p50_us": new_ns[p50] as f64 / 1000.0,
+                    "new_p95_us": new_ns[p95] as f64 / 1000.0
+                })
+            );
+            Ok(())
+        }
+
+        run_case(1_000, 20)?;
+        run_case(10_000, 20)?;
+        Ok(())
+    }
+
+    #[test]
+    fn one_attempt_and_message_window() -> Result<()> {
+        let s = Store::open(":memory:")?;
+        let c = Challenge {
+            chat_id: -100,
+            user_id: 31,
+            nonce: "first-message".into(),
+            flow: "member".into(),
+            status: "pending".into(),
+            delivery_chat_id: -100,
+            answer: 5,
+            options: vec![3, 5, 7],
+            attempts: 0,
+            expires_at: now() + 120,
+            message_id: Some(7),
+            action: None,
+            updated_at: now(),
+        };
+        s.create(&c)?;
+        assert!(s.claim(&c, "pass")?);
+        s.start_first_message_window(&c)?;
+        let waiting = s.get(-100, 31)?.context("challenge missing")?;
+        assert_eq!(waiting.status, "awaiting_message");
+        assert_eq!(waiting.expires_at - waiting.updated_at, 600);
+        assert!(!s.record_first_message(-100, 31, 12, waiting.updated_at - 1)?);
+        assert!(!s.record_first_message(-100, 31, 12, waiting.expires_at + 1)?);
+        assert!(s.record_first_message(-100, 31, 12, waiting.updated_at + 1)?);
+        assert!(!s.record_first_message(-100, 31, 12, waiting.updated_at + 2)?);
+        assert_eq!(s.get(-100, 31)?.unwrap().status, "passed");
+        assert!(!s.claim_first_message_timeout(&waiting)?);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_message_window_reserves_one_kick() -> Result<()> {
+        let s = Store::open(":memory:")?;
+        let c = Challenge {
+            chat_id: -300,
+            user_id: 88,
+            nonce: "expired-message".into(),
+            flow: "request".into(),
+            status: "pending".into(),
+            delivery_chat_id: 88,
+            answer: 12,
+            options: vec![11, 12],
+            attempts: 0,
+            expires_at: now() + 120,
+            message_id: Some(5),
+            action: None,
+            updated_at: now(),
+        };
+        s.create(&c)?;
+        assert!(s.claim(&c, "pass")?);
+        s.start_first_message_window(&c)?;
+        s.conn.execute(
+            "UPDATE challenges SET expires_at=?1 WHERE chat_id=?2 AND user_id=?3",
+            params![now() - 1, c.chat_id, c.user_id],
+        )?;
+        let waiting = s.get(-300, 88)?.context("challenge missing")?;
+        assert!(s.claim_first_message_timeout(&waiting)?);
+        assert!(!s.claim_first_message_timeout(&waiting)?);
+        assert!(!s.record_first_message(-300, 88, 10, now() - 1)?);
+        s.finish(&waiting, "failed")?;
+        assert_eq!(s.get(-300, 88)?.unwrap().status, "failed");
+        Ok(())
+    }
+
+    #[test]
     fn durable_offsets_and_settings() -> Result<()> {
         let s = Store::open(":memory:")?;
         s.offset_save(9)?;
         s.offset_save(3)?;
         assert_eq!(s.offset()?, 9);
-        assert_eq!(s.settings(-5)?.timeout, 90);
+        assert_eq!(s.settings(-5)?.timeout, 120);
+        assert_eq!(s.settings(-5)?.max_attempts, 1);
+        assert!(s.setting(-5, "attempts", 3).is_err());
         assert!(s.setting(-5, "timeout_s", 120).is_ok());
         assert_eq!(s.settings(-5)?.timeout, 120);
         assert!(s.setting(-5, "foo", 120).is_err());

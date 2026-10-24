@@ -13,7 +13,10 @@ fn stale_event(event_at: i64, now_at: i64) -> bool {
 }
 
 fn skip_existing(previous: &Challenge, new_flow: &str, now_at: i64) -> bool {
-    if matches!(previous.status.as_str(), "pending" | "acting" | "manual") {
+    if matches!(
+        previous.status.as_str(),
+        "pending" | "acting" | "manual" | "awaiting_message"
+    ) {
         return true;
     }
     // Telegram emits chat_member when a request is approved; never impose a
@@ -49,6 +52,8 @@ fn default_chat_permissions(chat: &Value) -> Result<Value> {
         "can_send_polls",
         "can_send_other_messages",
         "can_add_web_page_previews",
+        "can_react_to_messages",
+        "can_edit_tag",
         "can_change_info",
         "can_invite_users",
         "can_pin_messages",
@@ -65,6 +70,31 @@ fn default_chat_permissions(chat: &Value) -> Result<Value> {
         anyhow::bail!("group permissions are absent; manual review required");
     }
     Ok(Value::Object(permissions))
+}
+
+fn no_send_permissions() -> Value {
+    let mut permissions = serde_json::Map::new();
+    for name in [
+        "can_send_messages",
+        "can_send_audios",
+        "can_send_documents",
+        "can_send_photos",
+        "can_send_videos",
+        "can_send_video_notes",
+        "can_send_voice_notes",
+        "can_send_polls",
+        "can_send_other_messages",
+        "can_add_web_page_previews",
+        "can_react_to_messages",
+        "can_edit_tag",
+        "can_change_info",
+        "can_invite_users",
+        "can_pin_messages",
+        "can_manage_topics",
+    ] {
+        permissions.insert(name.to_string(), Value::Bool(false));
+    }
+    Value::Object(permissions)
 }
 
 pub struct Bot {
@@ -101,11 +131,10 @@ impl Bot {
         }
         let mut failures: HashMap<i64, u8> = HashMap::new();
         let mut poll_errors = 0u32;
+        // SQLite is the authority on startup and after any failed write.
+        // During successful polling, keep its already-committed offset in memory.
+        let mut offset = self.store.offset()?;
         loop {
-            if let Err(e) = self.sweep().await {
-                tracing::error!(error=%e,"maintenance");
-            }
-            let offset = self.store.offset()?;
             match self.tg.call("getUpdates",json!({
                 "offset":offset,"limit":50,"timeout":25,
                 "allowed_updates":["message","edited_message","callback_query","chat_member","chat_join_request"]
@@ -117,14 +146,21 @@ impl Bot {
                     for event in updates {
                         let id=event["update_id"].as_i64()
                             .context("Telegram update missing numeric update_id")?;
-                        if id<self.store.offset()? {continue;}
+                        if id < offset {
+                            continue;
+                        }
                         let Some(update)=self.decode_update(event)? else {
-                            // The individual malformed update is quarantined.
-                            // Remaining updates in the same batch still progress.
+                            // decode_update durably stores the dead letter and
+                            // updates the offset before it returns None.
+                            offset = id + 1;
                             continue;
                         };
                         match self.handle(update).await {
-                            Ok(())=>{self.store.offset_save(id+1)?;failures.remove(&id);},
+                            Ok(())=>{
+                                self.store.offset_save(id+1)?;
+                                offset = id + 1;
+                                failures.remove(&id);
+                            },
                             Err(err)=>{
                                 let count=failures.entry(id).or_default();
                                 *count=count.saturating_add(1);
@@ -132,6 +168,7 @@ impl Bot {
                                 if *count>=5 {
                                     self.store.deadletter(id,&err.to_string())?;
                                     self.store.offset_save(id+1)?;
+                                    offset = id + 1;
                                     failures.remove(&id);
                                 } else {
                                     tokio::time::sleep(Duration::from_secs(1u64 << (*count).min(5))).await;
@@ -146,6 +183,9 @@ impl Bot {
                     tracing::warn!(error=%e,"poll error");
                     tokio::time::sleep(Duration::from_secs(2u64.pow(poll_errors.min(5)))).await;
                 }
+            }
+            if let Err(e) = self.sweep().await {
+                tracing::error!(error=%e,"maintenance");
             }
         }
     }
@@ -359,15 +399,21 @@ impl Bot {
                     "restrictChatMember",
                     json!({
                         "chat_id":chat,"user_id":user.id,
-                        "permissions":{"can_send_messages":false},
+                        "permissions":no_send_permissions(),
                         "use_independent_chat_permissions":true
                     }),
                 )
                 .await;
             if let Err(e) = result {
-                self.store.manual(&c, &format!("restrict failed: {e}"))?;
+                self.store
+                    .audit(chat, user.id, "restrict_failed", &e.to_string())?;
+                // If Telegram refuses to restrict, attempt removal instead of
+                // silently leaving the newcomer able to send messages.
+                if self.store.claim(&c, "kick")? {
+                    self.perform(&c, "kick").await?;
+                }
                 tracing::error!(chat,user=user.id,error=%e,
-                    "Cannot restrict new member; admin attention required");
+                    "Could not restrict member; fail-closed removal requested");
                 return Ok(());
             }
         }
@@ -502,14 +548,14 @@ impl Bot {
                             .store
                             .get(chat, user)?
                             .context("challenge missing after acceptance")?;
-                        reply = if current.status == "passed" {
-                            "Проверка пройдена"
+                        reply = if matches!(current.status.as_str(), "passed" | "awaiting_message")
+                        {
+                            "Проверка пройдена. Напишите сообщение в группе за 10 минут."
                         } else {
                             "Ответ правильный; требуется проверка администратора"
                         };
                     } else {
-                        let limit = self.store.settings(chat)?.max_attempts;
-                        let (left, reject, fresh) = self.store.wrong_once(&state, limit, &c.id)?;
+                        let (left, reject, fresh) = self.store.wrong_once(&state, 1, &c.id)?;
                         if fresh {
                             if reject {
                                 // The transaction already reserved the terminal
@@ -525,7 +571,7 @@ impl Bot {
                                 .await?;
                             }
                             reply = if left == 0 {
-                                "Попытки закончились"
+                                "Проверка не пройдена"
                             } else {
                                 "Неверный ответ"
                             };
@@ -571,12 +617,12 @@ impl Bot {
                     Err(err) => Err(err),
                 }
             }
-            ("member", "kick") => {
+            ("member" | "request", "kick") => {
                 self.tg
                     .call(
                         "banChatMember",
                         json!({
-                            "chat_id":c.chat_id,"user_id":c.user_id,"until_date":now()+60
+                            "chat_id":c.chat_id,"user_id":c.user_id,"until_date":now()+86400
                         }),
                     )
                     .await
@@ -605,8 +651,11 @@ impl Bot {
         };
         match result {
             Ok(_) => {
-                self.store
-                    .finish(c, if action == "pass" { "passed" } else { "failed" })?;
+                if action == "pass" {
+                    self.store.start_first_message_window(c)?;
+                } else {
+                    self.store.finish(c, "failed")?;
+                }
                 if let Some(message) = c.message_id {
                     if let Err(e) = self
                         .tg
@@ -692,6 +741,10 @@ impl Bot {
         if self.moderate_links(&m, sender).await? {
             return Ok(());
         }
+        if !edited && !sender.is_bot && !text.trim().is_empty() && !text.starts_with('/') {
+            self.store
+                .record_first_message(m.chat.id, sender.id, m.message_id, m.date)?;
+        }
         if !edited && text.starts_with('/') {
             let words: Vec<&str> = text.split_whitespace().collect();
             let command = match words[0].split_once('@') {
@@ -709,7 +762,7 @@ impl Bot {
                 None => words[0],
             };
             if command == "/help" {
-                self.tg.send(m.chat.id,"/help /status /guard on|off /links on|off /lockdown on|off /timeout 30..300 /attempts 1..5 /pending /allow ID /deny ID /stats").await?;
+                self.tg.send(m.chat.id,"/help /status /guard on|off /links on|off /lockdown on|off /timeout 30..300 /pending /allow ID /deny ID /stats").await?;
                 return Ok(());
             }
             if !self.admin(m.chat.id, sender.id).await? {
@@ -821,11 +874,6 @@ impl Bot {
                     .ok()
                     .filter(|n| (30..=300).contains(n))
                     .map(|n| ("timeout_s", n)),
-                ("/attempts", Some(v)) => v
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|n| (1..=5).contains(n))
-                    .map(|n| ("attempts", n)),
                 _ => None,
             };
             if let Some((key, value)) = update {
@@ -916,11 +964,54 @@ impl Bot {
         Ok(())
     }
 
+    async fn expire_first_message(&self, c: &Challenge) -> Result<()> {
+        let member = match self
+            .tg
+            .call(
+                "getChatMember",
+                json!({"chat_id":c.chat_id,"user_id":c.user_id}),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.store
+                    .manual(c, "first message membership check failed")?;
+                tracing::warn!(error=%error, "first-message timeout requires manual review");
+                return Ok(());
+            }
+        };
+        let status = member["status"].as_str();
+        if matches!(status, Some("administrator" | "creator")) {
+            self.store
+                .close_first_message_window(c, "passed", "promoted to administrator")?;
+        } else if matches!(status, Some("left" | "kicked")) {
+            self.store
+                .close_first_message_window(c, "failed", "already left group")?;
+        } else if status == Some("member")
+            || (status == Some("restricted")
+                && member["is_member"] == true
+                && member["can_send_messages"] == true)
+        {
+            if self.store.claim_first_message_timeout(c)? {
+                self.perform(c, "kick").await?;
+            }
+        } else {
+            // A user still unable to send messages must not be kicked for
+            // failing the post-CAPTCHA write requirement.
+            self.store
+                .manual(c, "not confirmed as writable group member")?;
+        }
+        Ok(())
+    }
+
     async fn sweep(&self) -> Result<()> {
-        for c in self.store.open_challenges()? {
+        for c in self.store.sweep_candidates(now())? {
             if c.status == "acting" {
                 self.store
                     .manual(&c, "uncertain previous API action, verify manually")?;
+            } else if c.status == "awaiting_message" && c.expires_at <= now() {
+                self.expire_first_message(&c).await?;
             } else if c.status == "pending" && c.expires_at <= now() {
                 self.expire(&c).await?;
             } else if c.status == "pending" && c.message_id.is_none() {
@@ -935,6 +1026,184 @@ impl Bot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_initial_restriction_denies_media() {
+        let permissions = no_send_permissions();
+        for field in [
+            "can_send_messages",
+            "can_send_photos",
+            "can_send_videos",
+            "can_send_audios",
+            "can_send_voice_notes",
+            "can_send_polls",
+            "can_send_other_messages",
+            "can_react_to_messages",
+            "can_edit_tag",
+            "can_invite_users",
+        ] {
+            assert_eq!(permissions[field], false, "{field} must be disabled");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_wrong_answer_kicks_and_replay_does_not_kick_again() -> Result<()> {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        let success = ResponseTemplate::new(200).set_body_json(json!({"ok":true,"result":true}));
+        Mock::given(method("POST"))
+            .and(path("/botTEST/banChatMember"))
+            .respond_with(success.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/answerCallbackQuery"))
+            .respond_with(success)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let bot = Bot::new(
+            Store::open(":memory:")?,
+            Telegram::mock(format!("{}/botTEST/", server.uri())),
+        );
+        let c = Challenge {
+            chat_id: -401,
+            user_id: 43,
+            nonce: "one-answer".into(),
+            flow: "member".into(),
+            status: "pending".into(),
+            delivery_chat_id: -401,
+            answer: 6,
+            options: vec![6, 9],
+            attempts: 0,
+            expires_at: now() + 120,
+            message_id: None,
+            action: None,
+            updated_at: now(),
+        };
+        bot.store.create(&c)?;
+        let callback = Callback {
+            id: "one-click".into(),
+            user: User {
+                id: c.user_id,
+                is_bot: false,
+            },
+            data: Some(format!("q:{}:{}:{}:9", c.chat_id, c.user_id, c.nonce)),
+        };
+        bot.callback(callback.clone()).await?;
+        assert_eq!(
+            bot.store.get(c.chat_id, c.user_id)?.unwrap().status,
+            "failed"
+        );
+        bot.callback(callback).await?;
+        assert_eq!(
+            bot.store.get(c.chat_id, c.user_id)?.unwrap().status,
+            "failed"
+        );
+        server.verify().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_real_message_completes_admission() -> Result<()> {
+        use crate::model::Chat;
+        let store = Store::open(":memory:")?;
+        let c = Challenge {
+            chat_id: -701,
+            user_id: 72,
+            nonce: "write-once".into(),
+            flow: "member".into(),
+            status: "pending".into(),
+            delivery_chat_id: -701,
+            answer: 4,
+            options: vec![4, 8],
+            attempts: 0,
+            expires_at: now() + 120,
+            message_id: None,
+            action: None,
+            updated_at: now(),
+        };
+        store.create(&c)?;
+        assert!(store.claim(&c, "pass")?);
+        store.start_first_message_window(&c)?;
+        let bot = Bot::new(store, Telegram::mock("http://127.0.0.1:1/botTEST/".into()));
+        let msg = Message {
+            message_id: 80,
+            chat: Chat { id: c.chat_id },
+            date: now(),
+            sender: Some(User {
+                id: c.user_id,
+                is_bot: false,
+            }),
+            text: Some("Привет всем!".into()),
+            caption: None,
+            edit_date: None,
+            new_chat_members: Vec::new(),
+            entities: Vec::new(),
+            caption_entities: Vec::new(),
+        };
+        bot.message(msg).await?;
+        assert_eq!(
+            bot.store.get(c.chat_id, c.user_id)?.unwrap().status,
+            "passed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silent_user_after_request_approval_gets_one_kick() -> Result<()> {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getChatMember"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok":true,"result":{"status":"member"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/banChatMember"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok":true,"result":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = Store::open(":memory:")?;
+        let c = Challenge {
+            chat_id: -800,
+            user_id: 81,
+            nonce: "silent".into(),
+            flow: "request".into(),
+            status: "awaiting_message".into(),
+            delivery_chat_id: 81,
+            answer: 9,
+            options: vec![9],
+            attempts: 0,
+            expires_at: now() - 1,
+            message_id: None,
+            action: None,
+            updated_at: now() - 601,
+        };
+        store.create(&c)?;
+        let bot = Bot::new(store, Telegram::mock(format!("{}/botTEST/", server.uri())));
+        bot.sweep().await?;
+        bot.sweep().await?;
+        assert_eq!(
+            bot.store.get(c.chat_id, c.user_id)?.unwrap().status,
+            "failed"
+        );
+        server.verify().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn external_join_approval_closes_pending_request_without_second_captcha() -> Result<()> {
@@ -1834,6 +2103,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_offset_persists_malformed_updates_and_ignores_replays() -> Result<()> {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getMe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": {"id": 123, "is_bot": true, "username": "ReplayBot"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getWebhookInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": {"url": ""}
+            })))
+            .mount(&server)
+            .await;
+        let updates = json!([
+            {
+                "update_id": 500,
+                "message": {"message_id": 1, "chat": {"id": "invalid"}}
+            },
+            {
+                "update_id": 501,
+                "message": {
+                    "message_id": 2, "date": now(), "chat": {"id": -42},
+                    "from": {"id": 21, "is_bot": false}, "text": "hello"
+                }
+            },
+            {
+                "update_id": 501,
+                "message": {
+                    "message_id": 2, "date": now(), "chat": {"id": -42},
+                    "from": {"id": 21, "is_bot": false}, "text": "hello"
+                }
+            }
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getUpdates"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(35))
+                    .set_body_json(json!({"ok": true, "result": updates})),
+            )
+            .mount(&server)
+            .await;
+
+        let file = std::env::temp_dir().join(format!(
+            "bor-poll-offset-{}-{}.sqlite3",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = file.to_str().context("invalid database path")?;
+        let bot = Bot::new(
+            Store::open(path)?,
+            Telegram::mock(format!("{}/botTEST/", server.uri())),
+        );
+        let result = tokio::time::timeout(Duration::from_millis(450), bot.run()).await;
+        assert!(result.is_err(), "poller must keep serving updates");
+
+        let requests = server
+            .received_requests()
+            .await
+            .context("missing requests")?;
+        let offsets = requests
+            .iter()
+            .filter(|r| r.url.path() == "/botTEST/getUpdates")
+            .map(|r| -> Result<i64> {
+                let body: Value = serde_json::from_slice(&r.body)?;
+                body["offset"].as_i64().context("missing poll offset")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert!(offsets.len() >= 2, "poller did not request updates twice");
+        assert_eq!(offsets[0], 0, "first poll reads durable startup cursor");
+        assert!(
+            offsets.iter().skip(1).all(|offset| *offset == 502),
+            "duplicate and malformed updates must not rewind cursor: {offsets:?}"
+        );
+
+        // The cursor survives a process stop because SQLite is authoritative.
+        let reopened = Store::open(path)?;
+        assert_eq!(reopened.offset()?, 502);
+        drop(reopened);
+        std::fs::remove_file(file)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn refuses_polling_if_webhook_exists() -> Result<()> {
         use wiremock::{
             matchers::{method, path},
@@ -2016,7 +2376,7 @@ mod tests {
             data: Some(data),
         })
         .await?;
-        assert_eq!(bot.store.get(-100, 42)?.unwrap().status, "passed");
+        assert_eq!(bot.store.get(-100, 42)?.unwrap().status, "awaiting_message");
         Ok(())
     }
 

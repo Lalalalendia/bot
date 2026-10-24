@@ -1,0 +1,31 @@
+name: BOR resource measurement
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resources:
+    name: Offline RSS CPU SQLite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile offline profiler build
+        run: cargo build --release --locked --features resource-bench
+      - name: Sample idle and 200 join requests
+        run: python3 tools/measure_resources.py --binary target/release/rebuild-bot --events 200 --seconds 8 --output bor-resources-200.json
+      - name: Sample idle and 1000 join requests
+        run: python3 tools/measure_resources.py --binary target/release/rebuild-bot --events 1000 --seconds 15 --output bor-resources-1000.json
+      - name: Save results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bor-resource-report
+          path: bor-resources-*.json
+          if-no-files-found: warn

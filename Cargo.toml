@@ -20,3 +20,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 wiremock = "0.6"
+
+[features]
+resource-bench = []
