@@ -267,6 +267,18 @@ fi
         self.assertIn("bor-native-release-${{ github.event.pull_request.head.sha || github.sha }}", workflow)
         self.assertIn("if: github.event_name == 'pull_request' ||", workflow)
         self.assertIn("if: github.ref == 'refs/heads/main' &&", workflow)
+        self.assertIn("publish-public-pilot:", workflow)
+        self.assertIn("needs: verify-and-package", workflow)
+        self.assertIn("if: github.event_name == 'push' && github.ref == 'refs/heads/feat/bor-native-vps-release'", workflow)
+        self.assertIn("contents: write", workflow)
+        self.assertIn('gh release create "bor-pilot-$GITHUB_SHA"', workflow)
+        self.assertIn("bor-release.tar.gz bor-release.sha256", workflow)
+        helper = self.text("deploy/bor/pilot-download.sh")
+        self.assertIn("sha256sum -c bor-release.sha256", helper)
+        self.assertIn("tar -xOzf", helper)
+        self.assertIn("releases/download/bor-pilot-", helper)
+        self.assertNotIn("gh auth", helper)
+        self.assertNotIn("BOT_TOKEN", helper)
 
 if __name__ == "__main__":
     unittest.main()

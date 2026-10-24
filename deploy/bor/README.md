@@ -35,14 +35,27 @@ Do not proceed unless output includes `bor_shared_vps_preflight=PASS`
 and `shared_vps_mutations=no`. If the memory budget shrinks or PSI rises,
 refuse pilot deployment; never bypass checks.
 
-**Step B: Download the exact-head static release built by GitHub Actions.**
+**Step B: Direct HTTPS download from public GitHub release (no login).**
 
-Open the green "BOR native Rust VPS release" workflow for this branch in
-https://github.com/Lalalalendia/bot/actions, select its latest PR run and
-download artifact named `bor-native-release-<40-hex PR HEAD SHA>`.
-It contains `bor-release.tar.gz` and `bor-release.sha256`. Transfer
-both files to `/root/bor-packet` on the VPS (e.g., `scp` from Windows
-PowerShell). Do not run `cargo build` on this low-memory server.
+The feature-branch `push` workflow builds, verifies and publishes a
+SHA-pinned **public prerelease** in this public repository. The GitHub runner
+uses its own ephemeral `GITHUB_TOKEN` to publish the two checksum-verified
+files. **Never install gh or authenticate GitHub on the VPS.**
+
+After the corresponding native VPS CI and its public-pilot release job are
+both green, from the already cloned VPS checkout:
+
+    cd /root/bot
+    git pull --ff-only
+    bash deploy/bor/pilot-download.sh
+
+The helper downloads both files from
+`https://github.com/Lalalalendia/bot/releases/download/bor-pilot-<SHA>/`,
+verifies SHA-256 and the archive's SOURCE_SHA against the checked-out
+Git commit, then saves them in `/root/bor-packet`. No Docker, Rust compiler,
+SCP, GitHub CLI, interactive login or credentials are needed on the VPS.
+The later production auto-delivery uses the Erida-style GitHub Actions SSH
+secrets instead of the public pilot release.
 
 **Step C: One-time root bootstrap, credential provision and staged install.**
 

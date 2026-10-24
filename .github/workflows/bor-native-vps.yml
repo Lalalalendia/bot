@@ -10,7 +10,7 @@ on:
       - 'tools/test_native_deploy.py'
       - '.github/workflows/bor-native-vps.yml'
   push:
-    branches: [main]
+    branches: [main, feat/bor-native-vps-release]
     paths:
       - 'src/**'
       - 'Cargo.toml'
@@ -35,7 +35,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('bor-native-pr-{0}', github.event.pull_request.number) || 'bor-native-production' }}
+  group: ${{ github.event_name == 'pull_request' && format('bor-native-pr-{0}', github.event.pull_request.number) || format('bor-native-{0}', github.ref_name) }}
   # Superseded PR builds must not queue behind obsolete release packages.
   # Main/production deployments are deliberately not cancellable.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -93,7 +93,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         # No secrets in this artifact. This permits a manual pilot before
         # the stacked draft PRs are merged into main.
-        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request')
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/bor-native-vps-release'
         with:
           name: bor-native-release-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
@@ -101,6 +101,35 @@ jobs:
             bor-release.sha256
           if-no-files-found: error
           retention-days: 5
+
+  publish-public-pilot:
+    name: Publish anonymous-download BOR pilot prerelease
+    needs: verify-and-package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/bor-native-vps-release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bor-native-release-${{ github.sha }}
+      - name: Publish SHA-pinned release without any VPS secrets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha256sum --check bor-release.sha256
+          test "$(tar -xOzf bor-release.tar.gz SOURCE_SHA)" = "$GITHUB_SHA"
+          gh release create "bor-pilot-$GITHUB_SHA" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "BOR native pilot ${GITHUB_SHA:0:12}" \
+            --notes "Unmerged development pilot only. Read deploy/bor/README.md. Never use in a production Telegram group." \
+            bor-release.tar.gz bor-release.sha256
+          echo "bor_public_pilot_release=PASS"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/download/bor-pilot-$GITHUB_SHA/bor-release.tar.gz"
 
   stage-on-vps:
     name: Protected staging and optional first activation
