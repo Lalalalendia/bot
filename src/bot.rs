@@ -97,11 +97,37 @@ fn no_send_permissions() -> Value {
     Value::Object(permissions)
 }
 
+/// Pilot routing checks are purely local and never query Telegram.
+fn update_target_chat(update: &Update) -> Option<i64> {
+    if let Some(request) = &update.chat_join_request {
+        return Some(request.chat.id);
+    }
+    if let Some(change) = &update.chat_member {
+        return Some(change.chat.id);
+    }
+    if let Some(message) = &update.edited_message {
+        return Some(message.chat.id);
+    }
+    if let Some(message) = &update.message {
+        return Some(message.chat.id);
+    }
+    if let Some(callback) = &update.callback_query {
+        let data = callback.data.as_deref()?;
+        let mut fields = data.split(':');
+        if fields.next()? != "q" {
+            return None;
+        }
+        return fields.next()?.parse::<i64>().ok();
+    }
+    None
+}
+
 pub struct Bot {
     store: Store,
     tg: Telegram,
     id: i64,
     username: Option<String>,
+    pilot_chat_id: Option<i64>,
 }
 
 impl Bot {
@@ -111,7 +137,13 @@ impl Bot {
             tg,
             id: 0,
             username: None,
+            pilot_chat_id: None,
         }
+    }
+
+    pub fn scoped_to(mut self, chat_id: i64) -> Self {
+        self.pilot_chat_id = Some(chat_id);
+        self
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -887,6 +919,12 @@ impl Bot {
     }
 
     async fn handle(&self, u: Update) -> Result<()> {
+        if let Some(chat_id) = self.pilot_chat_id {
+            if update_target_chat(&u) != Some(chat_id) {
+                tracing::debug!(update_id = u.update_id, "pilot ignored out-of-scope update");
+                return Ok(());
+            }
+        }
         tracing::trace!(update_id = u.update_id, "handling Telegram update");
         if let Some(request) = u.chat_join_request {
             return self.join(request).await;
@@ -2430,6 +2468,51 @@ mod tests {
         assert_eq!(c.status, "manual");
         assert!(c.message_id.is_none());
         assert_eq!(bot.store.list_open(-100, 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn pilot_scope_ignores_other_chats_and_private_messages() -> Result<()> {
+        let test_group = -1001234567890_i64;
+        for chat in [test_group, -1009876543210_i64, 42] {
+            let update: Update = serde_json::from_value(json!({
+                "update_id": 1,
+                "message": { "message_id": 2, "chat": {"id": chat}, "text": "/status" }
+            }))?;
+            assert_eq!(
+                update_target_chat(&update) == Some(test_group),
+                chat == test_group
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pilot_scope_recognizes_join_and_callback_group() -> Result<()> {
+        let group = -1001234567890_i64;
+        let request: Update = serde_json::from_value(json!({
+            "update_id": 1,
+            "chat_join_request": {
+                "chat": {"id": group}, "from": {"id": 12},
+                "date": 1
+            }
+        }))?;
+        assert_eq!(update_target_chat(&request), Some(group));
+        let callback: Update = serde_json::from_value(json!({
+            "update_id": 2,
+            "callback_query": {
+                "id": "q1", "from": {"id": 12},
+                "data": format!("q:{group}:12:aa:6")
+            }
+        }))?;
+        assert_eq!(update_target_chat(&callback), Some(group));
+        let malformed: Update = serde_json::from_value(json!({
+            "update_id": 3,
+            "callback_query": {
+                "id": "q2", "from": {"id": 12}, "data": "other"
+            }
+        }))?;
+        assert_eq!(update_target_chat(&malformed), None);
         Ok(())
     }
 }
