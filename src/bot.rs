@@ -131,8 +131,10 @@ impl Bot {
         }
         let mut failures: HashMap<i64, u8> = HashMap::new();
         let mut poll_errors = 0u32;
+        // SQLite is the authority on startup and after any failed write.
+        // During successful polling, keep its already-committed offset in memory.
+        let mut offset = self.store.offset()?;
         loop {
-            let offset = self.store.offset()?;
             match self.tg.call("getUpdates",json!({
                 "offset":offset,"limit":50,"timeout":25,
                 "allowed_updates":["message","edited_message","callback_query","chat_member","chat_join_request"]
@@ -144,14 +146,21 @@ impl Bot {
                     for event in updates {
                         let id=event["update_id"].as_i64()
                             .context("Telegram update missing numeric update_id")?;
-                        if id<self.store.offset()? {continue;}
+                        if id < offset {
+                            continue;
+                        }
                         let Some(update)=self.decode_update(event)? else {
-                            // The individual malformed update is quarantined.
-                            // Remaining updates in the same batch still progress.
+                            // decode_update durably stores the dead letter and
+                            // updates the offset before it returns None.
+                            offset = self.store.offset()?;
                             continue;
                         };
                         match self.handle(update).await {
-                            Ok(())=>{self.store.offset_save(id+1)?;failures.remove(&id);},
+                            Ok(())=>{
+                                self.store.offset_save(id+1)?;
+                                offset = self.store.offset()?;
+                                failures.remove(&id);
+                            },
                             Err(err)=>{
                                 let count=failures.entry(id).or_default();
                                 *count=count.saturating_add(1);
@@ -159,6 +168,7 @@ impl Bot {
                                 if *count>=5 {
                                     self.store.deadletter(id,&err.to_string())?;
                                     self.store.offset_save(id+1)?;
+                                    offset = self.store.offset()?;
                                     failures.remove(&id);
                                 } else {
                                     tokio::time::sleep(Duration::from_secs(1u64 << (*count).min(5))).await;
