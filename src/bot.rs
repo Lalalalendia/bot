@@ -152,13 +152,13 @@ impl Bot {
                         let Some(update)=self.decode_update(event)? else {
                             // decode_update durably stores the dead letter and
                             // updates the offset before it returns None.
-                            offset = self.store.offset()?;
+                            offset = id + 1;
                             continue;
                         };
                         match self.handle(update).await {
                             Ok(())=>{
                                 self.store.offset_save(id+1)?;
-                                offset = self.store.offset()?;
+                                offset = id + 1;
                                 failures.remove(&id);
                             },
                             Err(err)=>{
@@ -168,7 +168,7 @@ impl Bot {
                                 if *count>=5 {
                                     self.store.deadletter(id,&err.to_string())?;
                                     self.store.offset_save(id+1)?;
-                                    offset = self.store.offset()?;
+                                    offset = id + 1;
                                     failures.remove(&id);
                                 } else {
                                     tokio::time::sleep(Duration::from_secs(1u64 << (*count).min(5))).await;
