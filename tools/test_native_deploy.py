@@ -184,8 +184,10 @@ fi
                           "rm -", "mkdir ", "tee "):
             self.assertNotIn(forbidden, script)
         activation = self.text("deploy/bor/activate-release.sh")
-        self.assertIn("bor-shared-vps-preflight --before", activation)
-        self.assertIn("bor-shared-vps-preflight --after", activation)
+        self.assertIn('bor-shared-vps-preflight "$before_phase"', activation)
+        self.assertIn("before_phase=--before", activation)
+        self.assertIn('bor-shared-vps-preflight "$after_phase"', activation)
+        self.assertIn("after_phase=--after", activation)
         self.assertIn('if [[ "$before_units" != "$after_units" ]]', activation)
         self.assertIn("error=erida_service_state_changed", activation)
         self.assertNotIn("systemctl restart chaptera-", activation)
