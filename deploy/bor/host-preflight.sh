@@ -17,6 +17,7 @@ for directory in /opt/bor /opt/bor/releases /var/lib/bor; do
 done
 test -f /etc/systemd/system/bor.service
 test -x /usr/local/libexec/bor-stage-release
+test -x /usr/local/libexec/bor-shared-vps-preflight
 test -x /usr/local/libexec/bor-activate-release
 test -x /usr/local/sbin/bor-install-credentials
 ram=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)

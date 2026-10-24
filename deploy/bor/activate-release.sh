@@ -59,6 +59,12 @@ if [[ "$previous" == "$release" ]]; then
   echo 'bor_release=ALREADY_CURRENT'
   exit 0
 fi
+# Read-only shared-host safety check before touching BOR or its SQLite.
+# The root-owned script is installed only by operator-reviewed bootstrap.
+shared_before=$(/usr/local/libexec/bor-shared-vps-preflight --before)
+printf '%s\n' "$shared_before"
+before_units=$(printf '%s\n' "$shared_before" | grep '^erida_unit=')
+test -n "$before_units"
 # Use SQLite online-backup API via sqlite3 CLI, never cp a live WAL database.
 sudo -n systemctl start bor-backup.service
 ln -s "$release" "$root/.current.next.$$"
@@ -70,5 +76,15 @@ sudo -n systemctl restart bor.service
 sleep 8
 systemctl is-active --quiet bor.service
 [[ "$(readlink -f -- "$root/current")" == "$release" ]]
+# Recheck both remaining resources and Erida's exact service states.
+# Any change triggers the existing BOR-only rollback trap.
+shared_after=$(/usr/local/libexec/bor-shared-vps-preflight --after)
+printf '%s\n' "$shared_after"
+after_units=$(printf '%s\n' "$shared_after" | grep '^erida_unit=')
+if [[ "$before_units" != "$after_units" ]]; then
+  echo 'error=erida_service_state_changed_during_bor_activation' >&2
+  false
+fi
+echo 'bor_shared_vps_erida_services_unchanged=PASS'
 trap - ERR
 echo "bor_release=PASS sha=$sha"

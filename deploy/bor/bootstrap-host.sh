@@ -36,6 +36,7 @@ install -o root -g root -m 0644 "$script_dir/bor-preflight.service" /etc/systemd
 install -o root -g root -m 0644 "$script_dir/bor-backup.service" /etc/systemd/system/bor-backup.service
 install -o root -g root -m 0755 "$script_dir/bor-backup.sh" /usr/local/libexec/bor-backup
 install -o root -g root -m 0755 "$script_dir/host-preflight.sh" /usr/local/libexec/bor-host-preflight
+install -o root -g root -m 0755 "$script_dir/shared-vps-preflight.sh" /usr/local/libexec/bor-shared-vps-preflight
 install -o root -g root -m 0755 "$script_dir/stage-release.sh" /usr/local/libexec/bor-stage-release
 install -o root -g root -m 0755 "$script_dir/activate-release.sh" /usr/local/libexec/bor-activate-release
 install -o root -g root -m 0755 "$script_dir/bor-install-credentials.sh" /usr/local/sbin/bor-install-credentials

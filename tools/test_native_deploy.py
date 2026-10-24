@@ -78,5 +78,119 @@ class NativeDeployTests(unittest.TestCase):
         self.assertNotIn("echo \"$BOR_BOT_TOKEN\"", workflow)
 
 
+    def mock_shared_vps(self, *, phase="--before", mem_kib=1048576,
+                        disk_mib=4096, telegram_status="403", erida_state="active"):
+        """Exercise the real, read-only Bash gate with mock external commands."""
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            bindir = Path(temp)
+            commands = {
+                "awk": '''#!/usr/bin/env bash
+if [[ " __D__* " == *"/proc/meminfo"* ]]; then
+  printf '%s\\n' "__D__{BOR_FAKE_MEM_KIB:-1048576}"
+else
+  exec /usr/bin/awk "__D__@"
+fi
+''',
+                "df": '''#!/usr/bin/env bash
+printf 'Filesystem 1M-blocks Used Available Use%% Mounted on\\n'
+printf '/dev/fake 10000 1000 %s 10%% /\\n' "__D__{BOR_FAKE_DISK_MIB:-4096}"
+''',
+                "curl": '''#!/usr/bin/env bash
+if [[ "__D__{BOR_FAKE_TELEGRAM:-403}" == offline ]]; then
+  exit 7
+fi
+printf '%s' "__D__{BOR_FAKE_TELEGRAM:-403}"
+''',
+                "systemctl": '''#!/usr/bin/env bash
+unit="__D__{*: -1}"
+if [[ "__D__{BOR_FAKE_ERIDA:-active}" == missing ]]; then
+  printf 'LoadState=not-found\\nActiveState=inactive\\n'
+elif [[ "__D__unit" == chaptera-reader.service ]]; then
+  printf 'LoadState=loaded\\nActiveState=%s\\n' "__D__{BOR_FAKE_ERIDA:-active}"
+elif [[ "__D__unit" == chaptera-translator-api.service ]]; then
+  printf 'LoadState=loaded\\nActiveState=inactive\\n'
+else
+  printf 'LoadState=not-found\\nActiveState=inactive\\n'
+fi
+''',
+            }
+            for name, source in commands.items():
+                binary = bindir / name
+                binary.write_text(source.replace("__D__", "$"), encoding="utf-8")
+                binary.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+            env.update(
+                BOR_FAKE_MEM_KIB=str(mem_kib),
+                BOR_FAKE_DISK_MIB=str(disk_mib),
+                BOR_FAKE_TELEGRAM=telegram_status,
+                BOR_FAKE_ERIDA=erida_state,
+            )
+            return subprocess.run(
+                ["bash", str(DEPLOY / "shared-vps-preflight.sh"), phase],
+                check=False, capture_output=True, text=True, env=env,
+            )
+
+    def test_shared_vps_accepts_healthy_erida_and_token_free_telegram(self):
+        result = self.mock_shared_vps()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bor_shared_vps_preflight=PASS", result.stdout)
+        self.assertIn("shared_vps_mutations=no", result.stdout)
+        self.assertIn("telegram_egress=PASS", result.stdout)
+        self.assertIn("erida_unit=chaptera-reader.service|active", result.stdout)
+        self.assertIn("erida_unit=chaptera-translator-api.service|inactive", result.stdout)
+
+    def test_shared_vps_blocks_historical_low_memory(self):
+        # Previous Erida observation: 313 MiB MemAvailable.
+        result = self.mock_shared_vps(mem_kib=313 * 1024)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("shared_vps_ram_below_768MiB", result.stderr)
+
+    def test_shared_vps_preserves_640_mib_after_activation(self):
+        self.assertNotEqual(
+            self.mock_shared_vps(mem_kib=700 * 1024, phase="--before").returncode, 0
+        )
+        self.assertEqual(
+            self.mock_shared_vps(mem_kib=700 * 1024, phase="--after").returncode, 0
+        )
+        self.assertNotEqual(
+            self.mock_shared_vps(mem_kib=630 * 1024, phase="--after").returncode, 0
+        )
+
+    def test_shared_vps_refuses_low_disk_and_blocked_telegram(self):
+        self.assertIn("shared_vps_disk_below_1536MiB",
+                      self.mock_shared_vps(disk_mib=512).stderr)
+        self.assertIn("telegram_egress_unavailable",
+                      self.mock_shared_vps(telegram_status="offline").stderr)
+        self.assertIn("telegram_https_bad_status",
+                      self.mock_shared_vps(telegram_status="503").stderr)
+
+    def test_shared_vps_fails_for_wrong_or_failed_erida_host(self):
+        result = self.mock_shared_vps(erida_state="missing")
+        self.assertIn("no_active_known_erida_service", result.stderr)
+        result = self.mock_shared_vps(erida_state="failed")
+        self.assertIn("erida_unit_not_stable", result.stderr)
+
+    def test_shared_vps_gate_is_read_only_and_rollback_is_bor_only(self):
+        script = self.text("deploy/bor/shared-vps-preflight.sh")
+        for forbidden in ("sudo ", "systemctl restart", "systemctl start",
+                          "systemctl stop", "systemctl enable", "BOT_TOKEN",
+                          "rm -", "mkdir ", "tee "):
+            self.assertNotIn(forbidden, script)
+        activation = self.text("deploy/bor/activate-release.sh")
+        self.assertIn("bor-shared-vps-preflight --before", activation)
+        self.assertIn("bor-shared-vps-preflight --after", activation)
+        self.assertIn('if [[ "$before_units" != "$after_units" ]]', activation)
+        self.assertIn("error=erida_service_state_changed", activation)
+        self.assertNotIn("systemctl restart chaptera-", activation)
+        self.assertIn("sudo -n systemctl restart bor.service", activation)
+        bootstrap = self.text("deploy/bor/bootstrap-host.sh")
+        self.assertIn("/usr/local/libexec/bor-shared-vps-preflight", bootstrap)
+        workflow = self.text(".github/workflows/bor-native-vps.yml")
+        self.assertIn("bash -s -- --before", workflow)
+        self.assertIn("bor-shared-vps-preflight.txt", workflow)
+
 if __name__ == "__main__":
     unittest.main()

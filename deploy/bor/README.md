@@ -41,13 +41,59 @@ workflow dispatch can stage without starting the bot. Automatic push-on-main
 deployment requires BOR_DEPLOY_ENABLED=true and the independent off-host
 restore approval marker on the VPS.
 
+
+## Shared FirstVDS with Erida: read-only safety gate
+
+This branch is intended for the *same* VPS as Chaptera/Erida, not a fresh
+standalone VPS. It does not alter Erida services, Nginx, networking or SQLite.
+Before the BOR bootstrap, an operator can run this read-only check from a
+trusted workstation with an existing read-only SSH login:
+
+    ssh USER@YOUR_VPS 'bash -s -- --before' < deploy/bor/shared-vps-preflight.sh
+
+Use the SSH fingerprint independently verified through the hosting provider;
+never disable host-key checking. No bot token is needed for this preflight.
+It works **before** /opt/bor exists and creates no files on the VPS.
+
+The fail-closed thresholds are conservative shared-service *admission gates*,
+not benchmark results or proof of future resource sufficiency:
+
+- Before install/switch: **at least 768 MiB MemAvailable** (512 MiB reserved
+  for the Erida source worker, 128 MiB BOR cgroup ceiling, 128 MiB safety margin).
+- After BOR startup: **at least 640 MiB MemAvailable**.
+- At least **1536 MiB free** on both the future release filesystem (/opt)
+  and SQLite filesystem (/var/lib); both can refer to the same mount.
+- Public HTTPS/TLS reachability of api.telegram.org **without a token**.
+  This only proves outgoing routing, not BotFather authorization.
+- At least one **active, known Chaptera/Erida systemd unit**, stable states
+  for all observed units, and no failed/activating/deactivating units. Checked
+  names are chaptera-reader, chaptera-translator-api, chaptera-translator-worker,
+  optional source-worker, and optional Drive/backup timers.
+- On activation, **the exact observed Erida unit/status map must be unchanged**.
+  Failure rolls back only BOR to the previous release, or stops BOR if it was
+  the first installation. It never restarts Erida or Nginx.
+
+GitHub Actions repeats this read-only gate before any staging, stores a
+sanitized 7-day preflight report, then the root-installed BOR activation script
+repeats it immediately before switching and after startup. Staging is denied
+if the shared gate cannot prove the host, capacity or Telegram connectivity.
+
+**Important:** Historical Erida preflight recorded only ~313 MiB available
+out of 891 MiB total. That is **below** the new 768 MiB gate. This is a
+historical observation, NOT a new reading of the VPS. Increase memory or free
+capacity only after a fresh operator measurement. Do not lower thresholds to
+force the deploy on an overloaded host.
+
+Since activation uses a root-owned local copy of shared-vps-preflight.sh,
+the operator must re-run the reviewed bootstrap after these scripts change.
+No GitHub release is authorized to update root-owned host scripts itself.
+
 ## 1. Operator bootstrap on a Linux x86_64 VPS
 
-Prerequisites: Ubuntu/Debian with systemd and sudo; verify the server identity
-from your hosting provider independently. At least 128 MiB MemAvailable and
-256 MiB free for release staging are required by the read-only host probe.
-Do not bypass the preflight by lowering the thresholds. If this shares the
-Erida/Chaptera VPS, measure current RAM and service impact independently.
+Prerequisites: Ubuntu/Debian with systemd and sudo. Verify server identity
+independently. The generic BOR host probe requires at least 128 MiB available
+and 256 MiB release disk, but the **stricter shared Erida VPS safety gate above
+is mandatory** for this deployment and takes precedence. Do not lower it.
 
 Clone the approved SHA of this branch on the server using the operator account
 (not the deployment user), then run:

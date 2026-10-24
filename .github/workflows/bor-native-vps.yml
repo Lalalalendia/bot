@@ -127,6 +127,15 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+      - name: Check Erida shared VPS capacity and Telegram HTTPS without mutation
+        run: |
+          set -euo pipefail
+          destination="$DEPLOY_USER@$DEPLOY_HOST"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" \
+            'bash -s -- --before' < deploy/bor/shared-vps-preflight.sh \
+            | tee "$RUNNER_TEMP/bor-shared-vps-preflight.txt"
+          grep -Fx 'bor_shared_vps_preflight=PASS' "$RUNNER_TEMP/bor-shared-vps-preflight.txt"
+          grep -Fx 'shared_vps_mutations=no' "$RUNNER_TEMP/bor-shared-vps-preflight.txt"
       - name: Read-only VPS preflight, then stage verified packet
         run: |
           set -euo pipefail
@@ -150,6 +159,14 @@ jobs:
           printf '%s\n%s\n' "$BOR_BOT_TOKEN" "$BOR_TEST_CHAT_ID" |
             ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" \
               'sudo -n /usr/local/sbin/bor-install-credentials'
+      - name: Record read-only shared VPS preflight receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bor-shared-vps-preflight-${{ github.sha }}
+          path: ${{ runner.temp }}/bor-shared-vps-preflight.txt
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Activate and verify, or restore previous binary
         if: (github.event_name == 'workflow_dispatch' && inputs.activate == true) || (github.event_name == 'push' && vars.BOR_DEPLOY_ENABLED == 'true')
         run: |
