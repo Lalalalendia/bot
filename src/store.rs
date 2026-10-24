@@ -614,8 +614,7 @@ mod tests {
 
         fn is_due(c: &Challenge, at: i64) -> bool {
             c.status == "acting"
-                || (c.status == "pending"
-                    && (c.message_id.is_none() || c.expires_at <= at))
+                || (c.status == "pending" && (c.message_id.is_none() || c.expires_at <= at))
                 || (c.status == "awaiting_message" && c.expires_at <= at)
         }
 
@@ -642,11 +641,7 @@ mod tests {
                     answer: 5,
                     options: vec![2, 5, 7],
                     attempts: 0,
-                    expires_at: if user_id % 103 == 0 {
-                        at - 1
-                    } else {
-                        at + 600
-                    },
+                    expires_at: if user_id % 103 == 0 { at - 1 } else { at + 600 },
                     message_id: if user_id % 31 == 0 {
                         None
                     } else {
