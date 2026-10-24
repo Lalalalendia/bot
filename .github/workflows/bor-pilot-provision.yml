@@ -81,6 +81,8 @@ jobs:
           [[ "$(systemctl show --value --property=MemoryMax bor.service)" == 67108864 ]]
           [[ "$(systemctl show --value --property=UnitFileState bor.service)" == disabled ]]
           ! systemctl is-active --quiet bor.service
+          # Marker is in /etc (root owned); /etc/bor itself must stay private.
+          [[ "$(stat -c '%u:%a' /etc/bor-pilot-mode)" == '0:644' ]]
           echo 'bor_staged_pilot=VERIFIED'
           REMOTE
 
