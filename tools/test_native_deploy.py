@@ -188,6 +188,11 @@ fi
         self.assertIn("sudo -n systemctl restart bor.service", activation)
         bootstrap = self.text("deploy/bor/bootstrap-host.sh")
         self.assertIn("/usr/local/libexec/bor-shared-vps-preflight", bootstrap)
+        self.assertIn('bash "$script_dir/shared-vps-preflight.sh" --before', bootstrap)
+        self.assertLess(
+            bootstrap.index('bash "$script_dir/shared-vps-preflight.sh" --before'),
+            bootstrap.index('useradd --system'),
+        )
         workflow = self.text(".github/workflows/bor-native-vps.yml")
         self.assertIn("bash -s -- --before", workflow)
         self.assertIn("bor-shared-vps-preflight.txt", workflow)

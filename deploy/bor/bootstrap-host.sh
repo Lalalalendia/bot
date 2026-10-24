@@ -11,6 +11,9 @@ for program in systemctl useradd install sudo visudo sha256sum flock sqlite3 tar
   command -v "$program" >/dev/null || { echo "error=missing_$program" >&2; exit 3; }
 done
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+# No users, units, directories or sudo grants may change until the
+# shared Erida VPS is proven safe by a completely read-only probe.
+bash "$script_dir/shared-vps-preflight.sh" --before
 if [[ -L /opt/bor || -L /etc/bor || -L /var/lib/bor ]]; then
   echo 'error=unexpected_symlink_in_service_roots' >&2
   exit 3

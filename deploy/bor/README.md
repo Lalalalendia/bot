@@ -102,6 +102,9 @@ Clone the approved SHA of this branch on the server using the operator account
     sudo apt-get install -y sqlite3 sudo openssh-server
     sudo bash deploy/bor/bootstrap-host.sh
 
+Bootstrap **reruns the read-only Shared VPS gate first**. If resources are
+insufficient, Telegram is unreachable or Erida has no active known service,
+it refuses before any BOR user, directory or systemd unit is created.
 The bootstrap creates the separate system user "bor", the unprivileged SSH
 deployment user "bor-deploy", systemd units, and a *strict sudo command allowlist*.
 It enables (but does not start) bor.service; no token is configured by bootstrap.
