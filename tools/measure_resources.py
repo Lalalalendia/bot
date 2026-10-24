@@ -71,7 +71,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = True
             else:
                 result = True
-        if name == "getUpdates" and not result:\n            time.sleep(0.25)  # mimic idle long polling instead of a busy loop\n        body = json.dumps({"ok": True, "result": result}).encode()
+        if name == "getUpdates" and not result:
+            time.sleep(0.25)  # mimic idle long polling instead of a busy loop
+        body = json.dumps({"ok": True, "result": result}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
