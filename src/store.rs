@@ -89,7 +89,11 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS processed_callbacks(
                callback_id TEXT PRIMARY KEY, at INTEGER NOT NULL
-             );",
+             );
+             CREATE INDEX IF NOT EXISTS idx_challenges_sweep_expiry
+                 ON challenges(status, expires_at);
+             CREATE INDEX IF NOT EXISTS idx_challenges_sweep_unsent
+                 ON challenges(status, message_id);",
         )?;
         // Upgrade existing groups to the single-attempt policy.
         conn.execute("UPDATE settings SET attempts=1 WHERE attempts<>1", [])?;
@@ -492,12 +496,20 @@ impl Store {
         Ok(counts)
     }
 
-    pub fn open_challenges(&self) -> Result<Vec<Challenge>> {
+    /// Materialize only work the maintenance loop can actually act upon.
+    /// Future CAPTCHA/probation rows stay indexed in SQLite rather than being
+    /// decoded, allocated, and looked up after every getUpdates response.
+    /// Unconfirmed deliveries must still be surfaced immediately after restart.
+    pub fn sweep_candidates(&self, as_of: i64) -> Result<Vec<Challenge>> {
         let mut stmt = self.conn.prepare(
-            "SELECT chat_id,user_id FROM challenges WHERE status IN ('pending','acting','manual','awaiting_message')",
+            "SELECT chat_id,user_id FROM challenges
+             WHERE status='acting'
+                OR (status='pending' AND message_id IS NULL)
+                OR (status='pending' AND expires_at<=?1)
+                OR (status='awaiting_message' AND expires_at<=?1)",
         )?;
         let keys = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .query_map([as_of], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         keys.into_iter()
             .map(|(chat, user)| self.get(chat, user)?.context("challenge disappeared"))
@@ -517,6 +529,191 @@ pub struct Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_loads_only_actionable_rows_even_with_many_future_challenges() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        let current = now();
+        for user_id in 1..=1_000_i64 {
+            store.create(&Challenge {
+                chat_id: -10,
+                user_id,
+                nonce: format!("sweep-{user_id}"),
+                flow: "member".into(),
+                status: if user_id % 2 == 0 {
+                    "awaiting_message"
+                } else {
+                    "pending"
+                }
+                .into(),
+                delivery_chat_id: -10,
+                answer: 7,
+                options: vec![3, 5, 7],
+                attempts: 0,
+                expires_at: current + 600,
+                message_id: Some(user_id),
+                action: None,
+                updated_at: current,
+            })?;
+        }
+        assert_eq!(store.sweep_candidates(current)?.len(), 0);
+
+        // Unsent pending challenge is actionable, regardless of its deadline.
+        store
+            .conn
+            .execute("UPDATE challenges SET message_id=NULL WHERE user_id=1", [])?;
+        // Pending and probation whose timers expired must still be returned.
+        store.conn.execute(
+            "UPDATE challenges SET expires_at=?1 WHERE user_id IN (2,3)",
+            [current - 1],
+        )?;
+        // In-flight API action needs manual reconciliation, even if not expired.
+        store
+            .conn
+            .execute("UPDATE challenges SET status='acting' WHERE user_id=4", [])?;
+        // Manual-review entries are not auto-actionable.
+        store
+            .conn
+            .execute("UPDATE challenges SET status='manual' WHERE user_id=5", [])?;
+        let candidates = store.sweep_candidates(current)?;
+        let mut ids: Vec<i64> = candidates.iter().map(|c| c.user_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        // A future-dated cutoff cannot pick up new rows from the current instant.
+        assert_eq!(
+            store
+                .sweep_candidates(current - 1)?
+                .iter()
+                .map(|c| c.user_id)
+                .filter(|id| *id == 6)
+                .count(),
+            0
+        );
+        Ok(())
+    }
+
+    /// Perf experiment, never used as a timing gate on shared CI runners.
+    /// The control path is the old Store::open_challenges implementation.
+    #[test]
+    #[ignore = "run in dedicated performance CI"]
+    fn bench_due_sweep_against_legacy() -> Result<()> {
+        use std::time::Instant;
+
+        fn legacy_scan(store: &Store) -> Result<Vec<Challenge>> {
+            let mut stmt = store.conn.prepare(
+                "SELECT chat_id,user_id FROM challenges
+                 WHERE status IN ('pending','acting','manual','awaiting_message')",
+            )?;
+            let keys = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            keys.into_iter()
+                .map(|(chat, user)| store.get(chat, user)?.context("challenge disappeared"))
+                .collect()
+        }
+
+        fn is_due(c: &Challenge, at: i64) -> bool {
+            c.status == "acting"
+                || (c.status == "pending" && (c.message_id.is_none() || c.expires_at <= at))
+                || (c.status == "awaiting_message" && c.expires_at <= at)
+        }
+
+        fn run_case(rows: i64, repeats: usize) -> Result<()> {
+            let store = Store::open(":memory:")?;
+            let at = now();
+            for user_id in 1..=rows {
+                let status = if user_id % 211 == 0 {
+                    "manual"
+                } else if user_id % 101 == 0 {
+                    "acting"
+                } else if user_id % 2 == 0 {
+                    "awaiting_message"
+                } else {
+                    "pending"
+                };
+                store.create(&Challenge {
+                    chat_id: -123,
+                    user_id,
+                    nonce: format!("bench-{user_id}"),
+                    flow: "member".into(),
+                    status: status.into(),
+                    delivery_chat_id: -123,
+                    answer: 5,
+                    options: vec![2, 5, 7],
+                    attempts: 0,
+                    expires_at: if user_id % 103 == 0 { at - 1 } else { at + 600 },
+                    message_id: if user_id % 31 == 0 {
+                        None
+                    } else {
+                        Some(user_id)
+                    },
+                    action: None,
+                    updated_at: at,
+                })?;
+            }
+
+            let old = legacy_scan(&store)?;
+            let due = store.sweep_candidates(at)?;
+            let mut expected: Vec<i64> = old
+                .iter()
+                .filter(|c| is_due(c, at))
+                .map(|c| c.user_id)
+                .collect();
+            let mut actual: Vec<i64> = due.iter().map(|c| c.user_id).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "must preserve every sanction candidate");
+
+            let mut old_ns = Vec::with_capacity(repeats);
+            let mut new_ns = Vec::with_capacity(repeats);
+            for iteration in 0..repeats {
+                if iteration % 2 == 0 {
+                    let start = Instant::now();
+                    let result = legacy_scan(&store)?;
+                    std::hint::black_box(result.len());
+                    old_ns.push(start.elapsed().as_nanos());
+
+                    let start = Instant::now();
+                    let result = store.sweep_candidates(at)?;
+                    std::hint::black_box(result.len());
+                    new_ns.push(start.elapsed().as_nanos());
+                } else {
+                    let start = Instant::now();
+                    let result = store.sweep_candidates(at)?;
+                    std::hint::black_box(result.len());
+                    new_ns.push(start.elapsed().as_nanos());
+
+                    let start = Instant::now();
+                    let result = legacy_scan(&store)?;
+                    std::hint::black_box(result.len());
+                    old_ns.push(start.elapsed().as_nanos());
+                }
+            }
+
+            old_ns.sort_unstable();
+            new_ns.sort_unstable();
+            let p50 = repeats / 2;
+            let p95 = ((repeats * 95) / 100).min(repeats - 1);
+            println!(
+                "BOR_SWEEP_BENCH {}",
+                serde_json::json!({
+                    "rows_waiting": rows,
+                    "rows_materialized_legacy": old.len(),
+                    "rows_materialized_due": due.len(),
+                    "repeats": repeats,
+                    "legacy_p50_us": old_ns[p50] as f64 / 1000.0,
+                    "legacy_p95_us": old_ns[p95] as f64 / 1000.0,
+                    "new_p50_us": new_ns[p50] as f64 / 1000.0,
+                    "new_p95_us": new_ns[p95] as f64 / 1000.0
+                })
+            );
+            Ok(())
+        }
+
+        run_case(1_000, 20)?;
+        run_case(10_000, 20)?;
+        Ok(())
+    }
 
     #[test]
     fn one_attempt_and_message_window() -> Result<()> {
