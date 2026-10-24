@@ -2103,6 +2103,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_offset_persists_malformed_updates_and_ignores_replays() -> Result<()> {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getMe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": {"id": 123, "is_bot": true, "username": "ReplayBot"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getWebhookInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": {"url": ""}
+            })))
+            .mount(&server)
+            .await;
+        let updates = json!([
+            {
+                "update_id": 500,
+                "message": {"message_id": 1, "chat": {"id": "invalid"}}
+            },
+            {
+                "update_id": 501,
+                "message": {
+                    "message_id": 2, "date": now(), "chat": {"id": -42},
+                    "from": {"id": 21, "is_bot": false}, "text": "hello"
+                }
+            },
+            {
+                "update_id": 501,
+                "message": {
+                    "message_id": 2, "date": now(), "chat": {"id": -42},
+                    "from": {"id": 21, "is_bot": false}, "text": "hello"
+                }
+            }
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getUpdates"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(35))
+                    .set_body_json(json!({"ok": true, "result": updates})),
+            )
+            .mount(&server)
+            .await;
+
+        let file = std::env::temp_dir().join(format!(
+            "bor-poll-offset-{}-{}.sqlite3",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = file.to_str().context("invalid database path")?;
+        let bot = Bot::new(
+            Store::open(path)?,
+            Telegram::mock(format!("{}/botTEST/", server.uri())),
+        );
+        let result = tokio::time::timeout(Duration::from_millis(450), bot.run()).await;
+        assert!(result.is_err(), "poller must keep serving updates");
+
+        let requests = server.received_requests().await.context("missing requests")?;
+        let offsets = requests
+            .iter()
+            .filter(|r| r.url.path() == "/botTEST/getUpdates")
+            .map(|r| -> Result<i64> {
+                let body: Value = serde_json::from_slice(&r.body)?;
+                Ok(body["offset"].as_i64().context("missing poll offset")?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert!(offsets.len() >= 2, "poller did not request updates twice");
+        assert_eq!(offsets[0], 0, "first poll reads durable startup cursor");
+        assert!(
+            offsets.iter().skip(1).all(|offset| *offset == 502),
+            "duplicate and malformed updates must not rewind cursor: {offsets:?}"
+        );
+
+        // The cursor survives a process stop because SQLite is authoritative.
+        let reopened = Store::open(path)?;
+        assert_eq!(reopened.offset()?, 502);
+        drop(reopened);
+        std::fs::remove_file(file)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn refuses_polling_if_webhook_exists() -> Result<()> {
         use wiremock::{
             matchers::{method, path},
