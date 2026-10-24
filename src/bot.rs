@@ -2166,7 +2166,10 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(450), bot.run()).await;
         assert!(result.is_err(), "poller must keep serving updates");
 
-        let requests = server.received_requests().await.context("missing requests")?;
+        let requests = server
+            .received_requests()
+            .await
+            .context("missing requests")?;
         let offsets = requests
             .iter()
             .filter(|r| r.url.path() == "/botTEST/getUpdates")
