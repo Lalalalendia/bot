@@ -1,0 +1,122 @@
+name: BOR pilot credential delivery from GitHub Secrets
+
+on:
+  push:
+    branches: [feat/bor-native-vps-release]
+    paths:
+      - '.github/workflows/bor-pilot-provision.yml'
+      - 'tools/bor_find_test_group.py'
+      - 'tools/test_bor_find_test_group.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bor-pilot-one-time-provision
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Offline check before any GitHub Secret is available
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest tools.test_bor_find_test_group -v
+
+  provision-and-start:
+    name: Protected GitHub Secret delivery to staged BOR
+    needs: verify
+    # Explicit opt-in; never run with pull_request or production credentials.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/bor-native-vps-release' && vars.BOR_PILOT_PROVISION_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: bor-pilot
+    env:
+      BOR_DEPLOY_HOST: ${{ secrets.BOR_DEPLOY_HOST }}
+      BOR_DEPLOY_SSH_KEY: ${{ secrets.BOR_DEPLOY_SSH_KEY }}
+      BOR_DEPLOY_KNOWN_HOSTS: ${{ secrets.BOR_DEPLOY_KNOWN_HOSTS }}
+      BOR_BOT_TOKEN: ${{ secrets.BOR_BOT_TOKEN }}
+      BOR_TEST_CHAT_ID: ${{ secrets.BOR_TEST_CHAT_ID }}
+      # The user has already staged and SHA-verified this specific release.
+      BOR_PILOT_STAGED_SHA: 26e3513fb4269890f135479af41e7df048e380b9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare SSH for the dedicated unprivileged BOR deploy account
+        run: |
+          set -euo pipefail
+          [[ "$BOR_DEPLOY_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || {
+            echo 'error=missing_or_invalid_BOR_DEPLOY_HOST' >&2; exit 3;
+          }
+          test -n "$BOR_DEPLOY_SSH_KEY" && test -n "$BOR_DEPLOY_KNOWN_HOSTS" || {
+            echo 'error=missing_BOR_SSH_GitHub_Secrets' >&2; exit 3;
+          }
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$BOR_DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$BOR_DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -P '' -f "$HOME/.ssh/id_ed25519" >/dev/null
+
+      - name: Check Erida safety, staged SHA, BOR pilot cap and service state
+        run: |
+          set -euo pipefail
+          destination="bor-deploy@$BOR_DEPLOY_HOST"
+          options=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          report=$(ssh "${options[@]}" "$destination" \
+            '/usr/local/libexec/bor-shared-vps-preflight --pilot-before')
+          printf '%s\n' "$report"
+          printf '%s\n' "$report" | grep -Fxq 'bor_shared_vps_preflight=PASS'
+          ssh "${options[@]}" "$destination" 'bash -s' -- "$BOR_PILOT_STAGED_SHA" <<'REMOTE'
+          set -euo pipefail
+          sha=$1
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          release="/opt/bor/releases/$sha"
+          test -d "$release" && test ! -L "$release"
+          [[ "$(cat "$release/SOURCE_SHA")" == "$sha" ]]
+          (cd "$release" && sha256sum --status -c SHA256SUMS)
+          [[ "$(systemctl show --value --property=MemoryMax bor.service)" == 67108864 ]]
+          [[ "$(systemctl show --value --property=UnitFileState bor.service)" == disabled ]]
+          ! systemctl is-active --quiet bor.service
+          echo 'bor_staged_pilot=VERIFIED'
+          REMOTE
+
+      - name: Obtain test supergroup ID and deliver BotFather secret without logging it
+        run: |
+          set -euo pipefail
+          test -n "$BOR_BOT_TOKEN" || {
+            echo 'error=missing_BOR_BOT_TOKEN_GitHub_Secret' >&2; exit 3;
+          }
+          if [[ -n "$BOR_TEST_CHAT_ID" ]]; then
+            chat_id="$BOR_TEST_CHAT_ID"
+          else
+            # No token in an argv, log, repo file, artifact or VPS environment.
+            chat_id=$(python3 tools/bor_find_test_group.py)
+          fi
+          [[ "$chat_id" =~ ^-100[0-9]{5,18}$ ]] || {
+            echo 'error=invalid_or_missing_test_supergroup' >&2; exit 3;
+          }
+          destination="bor-deploy@$BOR_DEPLOY_HOST"
+          options=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          printf '%s\n%s\n' "$BOR_BOT_TOKEN" "$chat_id" |
+            ssh "${options[@]}" "$destination" \
+              'sudo -n /usr/local/sbin/bor-install-credentials'
+
+      - name: Activate only the pinned, memory-limited pilot
+        run: |
+          set -euo pipefail
+          destination="bor-deploy@$BOR_DEPLOY_HOST"
+          options=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          ssh "${options[@]}" "$destination" \
+            "/usr/local/libexec/bor-activate-release '$BOR_PILOT_STAGED_SHA' --pilot"
+          ssh "${options[@]}" "$destination" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          systemctl is-active --quiet bor.service
+          [[ "$(systemctl show --value --property=MemoryMax bor.service)" == 67108864 ]]
+          [[ "$(systemctl show --value --property=UnitFileState bor.service)" == disabled ]]
+          echo 'bor_service=ACTIVE'
+          REMOTE
+          echo 'bor_github_secret_pilot=PASS'
