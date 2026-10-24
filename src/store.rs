@@ -131,23 +131,33 @@ impl Store {
     }
 
     pub fn settings(&self, chat: i64) -> Result<Settings> {
+        // Most calls read an existing group: avoid attempting an INSERT for
+        // every regular message. Keep the original durable defaults and the
+        // first-access INSERT for groups that do not exist yet.
+        let read = || -> Result<Option<Settings>> {
+            self.conn
+                .query_row(
+                    "SELECT enabled,timeout_s,attempts,links,lockdown FROM settings WHERE chat_id=?1",
+                    [chat],
+                    |r| {
+                        Ok(Settings {
+                            enabled: r.get::<_, i64>(0)? != 0,
+                            timeout: r.get(1)?,
+                            max_attempts: r.get(2)?,
+                            links: r.get::<_, i64>(3)? != 0,
+                            lockdown: r.get::<_, i64>(4)? != 0,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(Into::into)
+        };
+        if let Some(settings) = read()? {
+            return Ok(settings);
+        }
         self.conn
             .execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?1)", [chat])?;
-        self.conn
-            .query_row(
-                "SELECT enabled,timeout_s,attempts,links,lockdown FROM settings WHERE chat_id=?1",
-                [chat],
-                |r| {
-                    Ok(Settings {
-                        enabled: r.get::<_, i64>(0)? != 0,
-                        timeout: r.get(1)?,
-                        max_attempts: r.get(2)?,
-                        links: r.get::<_, i64>(3)? != 0,
-                        lockdown: r.get::<_, i64>(4)? != 0,
-                    })
-                },
-            )
-            .map_err(Into::into)
+        read()?.context("settings were not persisted after creating the group")
     }
 
     pub fn setting(&self, chat: i64, key: &str, value: i64) -> Result<()> {
@@ -712,6 +722,117 @@ mod tests {
 
         run_case(1_000, 20)?;
         run_case(10_000, 20)?;
+        Ok(())
+    }
+
+    #[test]
+    fn settings_fastpath_preserves_defaults_and_admin_changes() -> Result<()> {
+        let s = Store::open(":memory:")?;
+        let first = s.settings(-808)?;
+        assert!(first.enabled);
+        assert_eq!(first.timeout, 120);
+        assert_eq!(first.max_attempts, 1);
+        assert!(!first.links);
+        assert!(!first.lockdown);
+        let count: i64 = s.conn.query_row(
+            "SELECT COUNT(*) FROM settings WHERE chat_id=?1",
+            [-808],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1);
+
+        s.setting(-808, "timeout_s", 150)?;
+        s.setting(-808, "links", 1)?;
+        for _ in 0..100 {
+            let current = s.settings(-808)?;
+            assert_eq!(current.timeout, 150);
+            assert!(current.links);
+        }
+        let count: i64 = s.conn.query_row(
+            "SELECT COUNT(*) FROM settings WHERE chat_id=?1",
+            [-808],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1);
+        assert!(s.settings(-909)?.enabled);
+        Ok(())
+    }
+
+    /// Comparison on the same warmed SQLite connection and same group.
+    #[test]
+    #[ignore = "run only in the isolated settings performance workflow"]
+    fn bench_settings_read_fastpath() -> Result<()> {
+        use std::time::Instant;
+        let store = Store::open(":memory:")?;
+        let chat = -414;
+        let original = store.settings(chat)?;
+        let iterations: usize = 5_000;
+        let repeats: usize = 24;
+        let mut old_samples = Vec::with_capacity(repeats);
+        let mut new_samples = Vec::with_capacity(repeats);
+
+        fn old_settings(store: &Store, chat: i64) -> Result<Settings> {
+            store.conn.execute(
+                "INSERT OR IGNORE INTO settings(chat_id) VALUES(?1)",
+                [chat],
+            )?;
+            store.conn
+                .query_row(
+                    "SELECT enabled,timeout_s,attempts,links,lockdown FROM settings WHERE chat_id=?1",
+                    [chat],
+                    |r| {
+                        Ok(Settings {
+                            enabled: r.get::<_, i64>(0)? != 0,
+                            timeout: r.get(1)?,
+                            max_attempts: r.get(2)?,
+                            links: r.get::<_, i64>(3)? != 0,
+                            lockdown: r.get::<_, i64>(4)? != 0,
+                        })
+                    },
+                )
+                .map_err(Into::into)
+        }
+
+        for run in 0..repeats {
+            let mut bench_old = || -> Result<u128> {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    let x = old_settings(&store, chat)?;
+                    assert_eq!(x.timeout, original.timeout);
+                    std::hint::black_box(x.enabled);
+                }
+                Ok(start.elapsed().as_micros())
+            };
+            let mut bench_new = || -> Result<u128> {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    let x = store.settings(chat)?;
+                    assert_eq!(x.timeout, original.timeout);
+                    std::hint::black_box(x.enabled);
+                }
+                Ok(start.elapsed().as_micros())
+            };
+            if run % 2 == 0 {
+                old_samples.push(bench_old()?);
+                new_samples.push(bench_new()?);
+            } else {
+                new_samples.push(bench_new()?);
+                old_samples.push(bench_old()?);
+            }
+        }
+        old_samples.sort_unstable();
+        new_samples.sort_unstable();
+        println!(
+            "BOR_SETTINGS_BENCH {}",
+            serde_json::json!({
+                "repeats": repeats,
+                "reads_per_sample": iterations,
+                "old_p50_us": old_samples[repeats / 2],
+                "new_p50_us": new_samples[repeats / 2],
+                "old_p95_us": old_samples[(repeats * 95 / 100).min(repeats - 1)],
+                "new_p95_us": new_samples[(repeats * 95 / 100).min(repeats - 1)]
+            })
+        );
         Ok(())
     }
 
