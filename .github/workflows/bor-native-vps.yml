@@ -1,0 +1,164 @@
+name: BOR native Rust VPS release
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deploy/bor/**'
+      - 'tools/test_native_deploy.py'
+      - '.github/workflows/bor-native-vps.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deploy/bor/**'
+      - 'tools/test_native_deploy.py'
+      - '.github/workflows/bor-native-vps.yml'
+  workflow_dispatch:
+    inputs:
+      provision_credentials:
+        description: 'One-time install of BOT_TOKEN and test chat ID from protected secrets'
+        required: true
+        type: boolean
+        default: false
+      activate:
+        description: 'Activate staged release after read-only Telegram preflight'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('bor-native-pr-{0}', github.event.pull_request.number) || 'bor-native-production' }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-package:
+    name: Rust tests, shell checks, pinned musl release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install static-linker and shell linter
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq musl-tools shellcheck
+      - name: Validate native host/release scripts and unit contracts
+        run: |
+          set -euo pipefail
+          for script in deploy/bor/*.sh; do
+            bash -n "$script"
+            shellcheck -S error "$script"
+          done
+          python3 -m unittest discover -s tools -p 'test_native_deploy.py' -v
+      - name: Rust formatting, Clippy and tests (exact HEAD)
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+      - name: Build standalone x86_64 MUSL executable
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target x86_64-unknown-linux-musl
+          binary=target/x86_64-unknown-linux-musl/release/rebuild-bot
+          test -s "$binary"
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo 'error=release_binary_has_dynamic_interpreter' >&2
+            exit 2
+          fi
+          mkdir -p .bor-release
+          install -m 0755 "$binary" .bor-release/rebuild-bot
+          printf '%s\n' "$GITHUB_SHA" > .bor-release/SOURCE_SHA
+          (cd .bor-release && sha256sum rebuild-bot > SHA256SUMS)
+          tar -czf bor-release.tar.gz -C .bor-release rebuild-bot SOURCE_SHA SHA256SUMS
+          sha256sum bor-release.tar.gz > bor-release.sha256
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: bor-native-release-${{ github.sha }}
+          path: |
+            bor-release.tar.gz
+            bor-release.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  stage-on-vps:
+    name: Protected staging and optional first activation
+    needs: verify-and-package
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.BOR_DEPLOY_ENABLED == 'true'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.BOR_DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.BOR_DEPLOY_USER }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: bor-native-release-${{ github.sha }}
+      - name: Verify release packet and SSH identity
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.BOR_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.BOR_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST" && test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_SSH_KEY" && test -n "$DEPLOY_KNOWN_HOSTS"
+          test "$DEPLOY_USER" = 'bor-deploy'
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          sha256sum --status -c bor-release.sha256
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+      - name: Read-only VPS preflight, then stage verified packet
+        run: |
+          set -euo pipefail
+          destination="$DEPLOY_USER@$DEPLOY_HOST"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" '/usr/local/libexec/bor-host-preflight'
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" "mkdir -p -- 'bor-incoming/$GITHUB_SHA'"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            bor-release.tar.gz bor-release.sha256 "$destination:bor-incoming/$GITHUB_SHA/"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" \
+            "/usr/local/libexec/bor-stage-release '$GITHUB_SHA'"
+      - name: Provision one-time protected Telegram credential
+        if: github.event_name == 'workflow_dispatch' && inputs.provision_credentials == true
+        env:
+          BOR_BOT_TOKEN: ${{ secrets.BOR_BOT_TOKEN }}
+          BOR_TEST_CHAT_ID: ${{ secrets.BOR_TEST_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$BOR_BOT_TOKEN" && test -n "$BOR_TEST_CHAT_ID"
+          destination="$DEPLOY_USER@$DEPLOY_HOST"
+          # No token in command arguments, logs, build artifact or environment of the running service.
+          printf '%s\n%s\n' "$BOR_BOT_TOKEN" "$BOR_TEST_CHAT_ID" |
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" \
+              'sudo -n /usr/local/sbin/bor-install-credentials'
+      - name: Activate and verify, or restore previous binary
+        if: (github.event_name == 'workflow_dispatch' && inputs.activate == true) || (github.event_name == 'push' && vars.BOR_DEPLOY_ENABLED == 'true')
+        run: |
+          set -euo pipefail
+          destination="$DEPLOY_USER@$DEPLOY_HOST"
+          if [[ "$GITHUB_EVENT_NAME" == 'push' ]]; then
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" \
+              "/usr/local/libexec/bor-activate-release '$GITHUB_SHA' --unattended"
+          else
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$destination" \
+              "/usr/local/libexec/bor-activate-release '$GITHUB_SHA' manual"
+          fi
