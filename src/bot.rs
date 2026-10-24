@@ -131,8 +131,10 @@ impl Bot {
         }
         let mut failures: HashMap<i64, u8> = HashMap::new();
         let mut poll_errors = 0u32;
+        // SQLite is the authority on startup and after any failed write.
+        // During successful polling, keep its already-committed offset in memory.
+        let mut offset = self.store.offset()?;
         loop {
-            let offset = self.store.offset()?;
             match self.tg.call("getUpdates",json!({
                 "offset":offset,"limit":50,"timeout":25,
                 "allowed_updates":["message","edited_message","callback_query","chat_member","chat_join_request"]
@@ -144,14 +146,21 @@ impl Bot {
                     for event in updates {
                         let id=event["update_id"].as_i64()
                             .context("Telegram update missing numeric update_id")?;
-                        if id<self.store.offset()? {continue;}
+                        if id < offset {
+                            continue;
+                        }
                         let Some(update)=self.decode_update(event)? else {
-                            // The individual malformed update is quarantined.
-                            // Remaining updates in the same batch still progress.
+                            // decode_update durably stores the dead letter and
+                            // updates the offset before it returns None.
+                            offset = id + 1;
                             continue;
                         };
                         match self.handle(update).await {
-                            Ok(())=>{self.store.offset_save(id+1)?;failures.remove(&id);},
+                            Ok(())=>{
+                                self.store.offset_save(id+1)?;
+                                offset = id + 1;
+                                failures.remove(&id);
+                            },
                             Err(err)=>{
                                 let count=failures.entry(id).or_default();
                                 *count=count.saturating_add(1);
@@ -159,6 +168,7 @@ impl Bot {
                                 if *count>=5 {
                                     self.store.deadletter(id,&err.to_string())?;
                                     self.store.offset_save(id+1)?;
+                                    offset = id + 1;
                                     failures.remove(&id);
                                 } else {
                                     tokio::time::sleep(Duration::from_secs(1u64 << (*count).min(5))).await;
@@ -2089,6 +2099,97 @@ mod tests {
         assert!(
             default_chat_permissions(&json!({"permissions":{"can_send_messages":"true"}})).is_err()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_offset_persists_malformed_updates_and_ignores_replays() -> Result<()> {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getMe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": {"id": 123, "is_bot": true, "username": "ReplayBot"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getWebhookInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": {"url": ""}
+            })))
+            .mount(&server)
+            .await;
+        let updates = json!([
+            {
+                "update_id": 500,
+                "message": {"message_id": 1, "chat": {"id": "invalid"}}
+            },
+            {
+                "update_id": 501,
+                "message": {
+                    "message_id": 2, "date": now(), "chat": {"id": -42},
+                    "from": {"id": 21, "is_bot": false}, "text": "hello"
+                }
+            },
+            {
+                "update_id": 501,
+                "message": {
+                    "message_id": 2, "date": now(), "chat": {"id": -42},
+                    "from": {"id": 21, "is_bot": false}, "text": "hello"
+                }
+            }
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/botTEST/getUpdates"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(35))
+                    .set_body_json(json!({"ok": true, "result": updates})),
+            )
+            .mount(&server)
+            .await;
+
+        let file = std::env::temp_dir().join(format!(
+            "bor-poll-offset-{}-{}.sqlite3",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = file.to_str().context("invalid database path")?;
+        let bot = Bot::new(
+            Store::open(path)?,
+            Telegram::mock(format!("{}/botTEST/", server.uri())),
+        );
+        let result = tokio::time::timeout(Duration::from_millis(450), bot.run()).await;
+        assert!(result.is_err(), "poller must keep serving updates");
+
+        let requests = server
+            .received_requests()
+            .await
+            .context("missing requests")?;
+        let offsets = requests
+            .iter()
+            .filter(|r| r.url.path() == "/botTEST/getUpdates")
+            .map(|r| -> Result<i64> {
+                let body: Value = serde_json::from_slice(&r.body)?;
+                body["offset"].as_i64().context("missing poll offset")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert!(offsets.len() >= 2, "poller did not request updates twice");
+        assert_eq!(offsets[0], 0, "first poll reads durable startup cursor");
+        assert!(
+            offsets.iter().skip(1).all(|offset| *offset == 502),
+            "duplicate and malformed updates must not rewind cursor: {offsets:?}"
+        );
+
+        // The cursor survives a process stop because SQLite is authoritative.
+        let reopened = Store::open(path)?;
+        assert_eq!(reopened.offset()?, 502);
+        drop(reopened);
+        std::fs::remove_file(file)?;
         Ok(())
     }
 
