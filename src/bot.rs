@@ -996,7 +996,7 @@ impl Bot {
     }
 
     async fn sweep(&self) -> Result<()> {
-        for c in self.store.open_challenges()? {
+        for c in self.store.sweep_candidates(now())? {
             if c.status == "acting" {
                 self.store
                     .manual(&c, "uncertain previous API action, verify manually")?;
