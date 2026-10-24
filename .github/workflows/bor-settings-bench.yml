@@ -1,0 +1,19 @@
+name: BOR settings read benchmark
+on:
+  pull_request:
+    paths:
+      - "src/store.rs"
+      - ".github/workflows/bor-settings-bench.yml"
+permissions:
+  contents: read
+jobs:
+  settings:
+    if: github.event.pull_request.head.ref == 'exp/bor-settings-read-fastpath'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compare previous and new settings reads
+        run: cargo test --release --locked bench_settings_read_fastpath -- --ignored --nocapture
