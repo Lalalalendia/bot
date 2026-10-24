@@ -46,6 +46,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Pull requests compile their HEAD, not a synthetic GitHub merge SHA.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,19 +83,22 @@ jobs:
           fi
           mkdir -p .bor-release
           install -m 0755 "$binary" .bor-release/rebuild-bot
-          printf '%s\n' "$GITHUB_SHA" > .bor-release/SOURCE_SHA
+          SOURCE_SHA=$(git rev-parse HEAD)
+          printf '%s\n' "$SOURCE_SHA" > .bor-release/SOURCE_SHA
           (cd .bor-release && sha256sum rebuild-bot > SHA256SUMS)
           tar -czf bor-release.tar.gz -C .bor-release rebuild-bot SOURCE_SHA SHA256SUMS
           sha256sum bor-release.tar.gz > bor-release.sha256
       - uses: actions/upload-artifact@v4
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        # No secrets in this artifact. This permits a manual pilot before
+        # the stacked draft PRs are merged into main.
+        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request')
         with:
-          name: bor-native-release-${{ github.sha }}
+          name: bor-native-release-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             bor-release.tar.gz
             bor-release.sha256
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 5
 
   stage-on-vps:
     name: Protected staging and optional first activation

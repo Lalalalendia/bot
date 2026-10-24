@@ -5,6 +5,91 @@ deploy anything just by being merged into a feature branch. Live Telegram
 acceptance, server bootstrap and GitHub Environment provisioning are operator
 actions. The production long-poller is never started by a pull-request CI job.
 
+
+## 0. Limited-memory pilot on an existing 891-MiB shared VPS
+
+Only use this path with a separate test BotFather token and an isolated test
+supergroup, **never** the working community bot or real production chat.
+This avoids unsafe native Rust compilation on a busy 1-GiB VPS.
+
+Pilot gate is explicitly different from production:
+
+- Admission: >=256 MiB MemAvailable and PSI memory "some avg10" <=1.00%
+  and "full avg10" <=0.20%, with the same disk/Telegram/Erida checks.
+- After launch: >=192 MiB MemAvailable and the same pressure/service checks.
+- Strict production thresholds of 768/640 MiB remain unchanged.
+- Pilot drop-in caps BOR at **64 MiB RAM and 25% CPU** and disables automatic
+  restart. The BOR service is **not enabled on boot** during the pilot.
+- Rust runtime ignores messages, joins and callbacks outside TEST_CHAT_ID.
+  Never use a token already running another long-polling process.
+
+**Step A: Update checkout on the VPS and inspect the read-only pilot gate:**
+
+    cd /root/bot
+    git fetch origin feat/bor-native-vps-release
+    git switch feat/bor-native-vps-release
+    git pull --ff-only
+    bash deploy/bor/shared-vps-preflight.sh --pilot-before
+
+Do not proceed unless output includes `bor_shared_vps_preflight=PASS`
+and `shared_vps_mutations=no`. If the memory budget shrinks or PSI rises,
+refuse pilot deployment; never bypass checks.
+
+**Step B: Download the exact-head static release built by GitHub Actions.**
+
+Open the green "BOR native Rust VPS release" workflow for this branch in
+https://github.com/Lalalalendia/bot/actions, select its latest PR run and
+download artifact named `bor-native-release-<40-hex PR HEAD SHA>`.
+It contains `bor-release.tar.gz` and `bor-release.sha256`. Transfer
+both files to `/root/bor-packet` on the VPS (e.g., `scp` from Windows
+PowerShell). Do not run `cargo build` on this low-memory server.
+
+**Step C: One-time root bootstrap, credential provision and staged install.**
+
+    cd /root/bot
+    sudo apt-get update
+    sudo apt-get install -y sqlite3 sudo
+    sudo bash deploy/bor/bootstrap-host.sh --pilot
+    sha=$(git rev-parse HEAD)
+    cd /root/bor-packet
+    sha256sum -c bor-release.sha256
+    tar -xOzf bor-release.tar.gz SOURCE_SHA | grep -Fx "$sha"
+    sudo install -d -m 0700 -o bor-deploy -g bor-deploy "/home/bor-deploy/bor-incoming/$sha"
+    sudo install -m 0600 -o bor-deploy -g bor-deploy bor-release.tar.gz bor-release.sha256 "/home/bor-deploy/bor-incoming/$sha/"
+    sudo -u bor-deploy -H /usr/local/libexec/bor-stage-release "$sha"
+
+Run these commands only after confirming `sha` matches the downloaded
+artifact. The root bootstrap itself repeats the pilot resource gate.
+Provision the secret without printing it:
+
+    read -rs -p 'TEST BotFather token: ' BOR_TOKEN; echo
+    read -r -p 'Test supergroup ID (-100...): ' BOR_CHAT
+    printf '%s\n%s\n' "$BOR_TOKEN" "$BOR_CHAT" |
+      sudo /usr/local/sbin/bor-install-credentials
+    unset BOR_TOKEN BOR_CHAT
+
+The token is not stored in the repository. For later automated production
+rollouts use protected GitHub Environment secrets; the pilot is a one-time
+operator installation because the native deploy workflow is not yet in main.
+
+**Step D: Manual start after Telegram preflight:**
+
+    sudo -u bor-deploy -H /usr/local/libexec/bor-activate-release "$sha" --pilot
+    systemctl status bor.service --no-pager
+    systemctl show bor.service -p MemoryMax -p MemoryCurrent -p CPUQuotaPerSecUSec
+    readlink -f /opt/bor/current
+    journalctl -u bor.service -n 50 --no-pager
+
+Any failure should stop or roll back *only BOR*. To stop the pilot:
+
+    sudo systemctl stop bor.service
+
+Do not enable `BOR_DEPLOY_ENABLED` or create
+`/etc/bor-unattended-approved` on this constrained pilot. Run real
+Telegram tests before enabling any bot autostart. Keep 319 MiB available
+RAM and zero PSI in perspective: these were the prior user measurements,
+not a guarantee of current headroom.
+
 ## Source and release layout
 
 Borrowed from the established Chaptera/Erida first-VPS deployment practices:

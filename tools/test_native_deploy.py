@@ -79,7 +79,8 @@ class NativeDeployTests(unittest.TestCase):
 
 
     def mock_shared_vps(self, *, phase="--before", mem_kib=1048576,
-                        disk_mib=4096, telegram_status="403", erida_state="active"):
+                        disk_mib=4096, telegram_status="403", erida_state="active",
+                        psi_avg10="0.00"):
         """Exercise the real, read-only Bash gate with mock external commands."""
         import os
         import tempfile
@@ -89,6 +90,8 @@ class NativeDeployTests(unittest.TestCase):
                 "awk": '''#!/usr/bin/env bash
 if [[ " __D__* " == *"/proc/meminfo"* ]]; then
   printf '%s\\n' "__D__{BOR_FAKE_MEM_KIB:-1048576}"
+elif [[ " __D__* " == *"/proc/pressure/memory"* ]]; then
+  printf '%s\\n' "__D__{BOR_FAKE_PSI:-0.00}"
 else
   exec /usr/bin/awk "__D__@"
 fi
@@ -127,6 +130,7 @@ fi
                 BOR_FAKE_DISK_MIB=str(disk_mib),
                 BOR_FAKE_TELEGRAM=telegram_status,
                 BOR_FAKE_ERIDA=erida_state,
+                BOR_FAKE_PSI=psi_avg10,
             )
             return subprocess.run(
                 ["bash", str(DEPLOY / "shared-vps-preflight.sh"), phase],
@@ -202,6 +206,65 @@ fi
                        "stage-release.sh", "bor.service",
                        "bor-preflight.service", "bor-backup.service"):
             self.assertIn(f"deploy/bor/{source}|", workflow)
+
+
+    def test_pilot_resource_gate_accepts_measured_vps_only_without_pressure(self):
+        pilot = self.mock_shared_vps(phase="--pilot-before", mem_kib=319 * 1024)
+        self.assertEqual(pilot.returncode, 0, pilot.stdout + pilot.stderr)
+        self.assertIn("pilot_memory_some_avg10=0.00", pilot.stdout)
+        self.assertIn("bor_shared_vps_preflight=PASS", pilot.stdout)
+
+        # Relaxed threshold must NEVER apply to production profiles.
+        strict = self.mock_shared_vps(phase="--before", mem_kib=319 * 1024)
+        self.assertIn("shared_vps_ram_below_768MiB", strict.stderr)
+
+    def test_pilot_stops_on_memory_pressure_or_low_available_ram(self):
+        self.assertIn("pilot_memory_pressure_too_high",
+                      self.mock_shared_vps(phase="--pilot-before",
+                                           mem_kib=319 * 1024,
+                                           psi_avg10="2.00").stderr)
+        self.assertIn("shared_vps_ram_below_256MiB",
+                      self.mock_shared_vps(phase="--pilot-before",
+                                           mem_kib=250 * 1024).stderr)
+        self.assertIn("shared_vps_ram_below_192MiB",
+                      self.mock_shared_vps(phase="--pilot-after",
+                                           mem_kib=180 * 1024).stderr)
+        self.assertEqual(self.mock_shared_vps(phase="--pilot-after",
+                                              mem_kib=200 * 1024).returncode, 0)
+
+    def test_pilot_requires_root_bootstrap_and_enforces_64mib_cap(self):
+        bootstrap = self.text("deploy/bor/bootstrap-host.sh")
+        activation = self.text("deploy/bor/activate-release.sh")
+        unit = self.text("deploy/bor/bor-pilot.conf")
+        main = self.text("src/main.rs")
+        bot = self.text("src/bot.rs")
+        self.assertIn('shared-vps-preflight.sh" --pilot-before', bootstrap)
+        self.assertIn('systemctl is-active --quiet bor.service', bootstrap)
+        self.assertIn('systemctl is-enabled --quiet bor.service', bootstrap)
+        self.assertIn("install -o root -g root -m 0644", bootstrap)
+        self.assertIn("/etc/bor/pilot-mode", bootstrap)
+        self.assertIn("MemoryHigh=48M", unit)
+        self.assertIn("MemoryMax=64M", unit)
+        self.assertIn("CPUQuota=25%", unit)
+        self.assertIn("Restart=no", unit)
+        self.assertIn("BOR_PILOT_MODE=1", unit)
+        self.assertIn("EnvironmentFile=/etc/bor/preflight.env", unit)
+        self.assertIn('memory_max" == 67108864', activation)
+        self.assertIn("pilot_cannot_autoactivate", activation)
+        self.assertIn("--pilot-before", activation)
+        self.assertIn("--pilot-after", activation)
+        self.assertIn("BOR_PILOT_MODE", main)
+        self.assertIn("TEST_CHAT_ID required when BOR_PILOT_MODE=1", main)
+        self.assertIn("pilot ignored out-of-scope update", bot)
+        self.assertIn("update_target_chat(&u) != Some(chat_id)", bot)
+
+    def test_pr_release_artifact_is_pinned_to_branch_head(self):
+        workflow = self.text(".github/workflows/bor-native-vps.yml")
+        self.assertIn("github.event.pull_request.head.sha || github.sha", workflow)
+        self.assertIn('SOURCE_SHA=$(git rev-parse HEAD)', workflow)
+        self.assertIn("bor-native-release-${{ github.event.pull_request.head.sha || github.sha }}", workflow)
+        self.assertIn("if: github.event_name == 'pull_request' ||", workflow)
+        self.assertIn("if: github.ref == 'refs/heads/main' &&", workflow)
 
 if __name__ == "__main__":
     unittest.main()
