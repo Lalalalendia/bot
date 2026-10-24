@@ -23,43 +23,6 @@ fn load_bot_token(env_token: Option<String>, credentials_dir: Option<PathBuf>) -
     Ok(token.to_owned())
 }
 
-#[cfg(test)]
-mod credential_tests {
-    use super::*;
-
-    #[test]
-    fn local_env_token_remains_supported() -> Result<()> {
-        assert_eq!(
-            load_bot_token(Some("local:test".into()), None)?,
-            "local:test"
-        );
-        assert!(load_bot_token(None, None).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn missing_systemd_credential_never_falls_back_to_env() {
-        let missing =
-            std::env::temp_dir().join(format!("bor-no-credential-{}", rand::random::<u64>()));
-        let err = load_bot_token(Some("local:test".into()), Some(missing)).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("read systemd bot_token credential"));
-    }
-
-    #[test]
-    fn systemd_credential_takes_priority_and_trims_newline() -> Result<()> {
-        let directory =
-            std::env::temp_dir().join(format!("bor-test-credential-{}", rand::random::<u64>()));
-        std::fs::create_dir(&directory)?;
-        std::fs::write(directory.join("bot_token"), b"12345:EXAMPLE\n")?;
-        let actual = load_bot_token(Some("must-not-be-used".into()), Some(directory.clone()))?;
-        std::fs::remove_dir_all(directory)?;
-        assert_eq!(actual, "12345:EXAMPLE");
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -104,4 +67,41 @@ async fn main() -> Result<()> {
         std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/rebuild.sqlite3".into());
     let bot = Bot::new(Store::open(&database)?, tg);
     bot.run().await
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn local_env_token_remains_supported() -> Result<()> {
+        assert_eq!(
+            load_bot_token(Some("local:test".into()), None)?,
+            "local:test"
+        );
+        assert!(load_bot_token(None, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_systemd_credential_never_falls_back_to_env() {
+        let missing =
+            std::env::temp_dir().join(format!("bor-no-credential-{}", rand::random::<u64>()));
+        let err = load_bot_token(Some("local:test".into()), Some(missing)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("read systemd bot_token credential"));
+    }
+
+    #[test]
+    fn systemd_credential_takes_priority_and_trims_newline() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("bor-test-credential-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory)?;
+        std::fs::write(directory.join("bot_token"), b"12345:EXAMPLE\n")?;
+        let actual = load_bot_token(Some("must-not-be-used".into()), Some(directory.clone()))?;
+        std::fs::remove_dir_all(directory)?;
+        assert_eq!(actual, "12345:EXAMPLE");
+        Ok(())
+    }
 }
