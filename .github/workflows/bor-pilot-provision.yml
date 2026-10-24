@@ -7,6 +7,8 @@ on:
       - '.github/workflows/bor-pilot-provision.yml'
       - 'tools/bor_find_test_group.py'
       - 'tools/test_bor_find_test_group.py'
+  # Allow an authorized retry without a dummy code commit.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,8 +31,8 @@ jobs:
   provision-and-start:
     name: Protected GitHub Secret delivery to staged BOR
     needs: verify
-    # Explicit opt-in; never run with pull_request or production credentials.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/bor-native-vps-release' && vars.BOR_PILOT_PROVISION_ENABLED == 'true'
+    # Explicit opt-in; only this branch, no pull-request or production credentials.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/feat/bor-native-vps-release' && vars.BOR_PILOT_PROVISION_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: bor-pilot
